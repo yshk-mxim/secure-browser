@@ -46,6 +46,7 @@ chmod 700 ~/secure-browser
 The first run:
 
 - installs or updates **Apple Container** from Apple's signed package, if needed (asks once, then asks for your admin password);
+- **may override Homebrew for security.** If your `container` command comes from Homebrew, the launcher offers to uninstall that copy (`brew uninstall container`) and replace it with Apple's signed, notarized package, so security fixes actually apply. It asks first, keeps your images and volumes, and won't launch if you decline. It never installs Homebrew, and only uses it if it's already there (for `RESEARCH_MODE=0`);
 - builds the browser VM image, which takes a few minutes;
 - opens Safari with the browser inside.
 
