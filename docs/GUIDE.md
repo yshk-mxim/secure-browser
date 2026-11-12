@@ -182,6 +182,7 @@ So `auto` keeps the profile only for the Proton browser extension (`VPN=0`, `INS
 ~/secure-browser --stop     # end the session (the research VM is deleted)
 ~/secure-browser --update   # run all update checks now and rebuild
 ~/secure-browser --check    # dependency check, no changes
+~/secure-browser --uninstall   # remove what it created, at a level you choose (see Uninstall)
 ~/secure-browser --import-vpn      # save Proton's WireGuard text from the clipboard
 ~/secure-browser --reset-profile   # delete the persistent profile (mode 0 only)
 ```
@@ -272,6 +273,19 @@ Then check by hand in the research browser:
 - **"kernel lacks port-based routing rules":** the VM kernel can't run the viewer behind the kill switch. Please report it. As a temporary workaround, `VPN=0` works, but the browser can then reach your network.
 - **Wrong window size:** resize the Safari window. The viewer asks the VM to match it.
 - **Keyboard shortcuts:** use Ctrl instead of Command inside the browser.
+
+## Uninstall
+
+`~/secure-browser --uninstall` is interactive. It asks how much to remove, prints the exact list, and deletes nothing until you confirm. Levels are cumulative:
+
+1. **Session only:** stop the browser, delete its VM (`secure-browser-research`) and the session state. The image stays, so relaunching is fast.
+2. **+ Browser image:** also delete `localhost/secure-browser-hardened`, the build folder (`~/.secure-browser-wayland/hardened-build`) and stop the image builder (`buildkit`). Relaunching rebuilds the image.
+3. **+ Data:** also delete the persistent profile volume (`secure-browser-profile`, mode 0 only), the `Secure Chromium` entry in Cocoa-Way's `container-sessions.toml`, and the whole `~/.secure-browser-wayland` folder (update times, the working VPN copy, logs).
+4. **+ Everything:** also delete your saved WireGuard config (`~/.config/secure-browser/wireguard.conf`) and the script itself.
+
+Never removed, because they're shared or not ours: **Apple Container** (system-wide; use the uninstall script from [`apple/container`](https://github.com/apple/container)), **Homebrew packages** (Cocoa-Way and Waypipe, if you installed them for mode 0), the **Debian base image** (`container image delete debian:trixie-slim` if nothing else uses it) and your **`~/Downloads/secure-browser`** folder. The end of the run lists these with the commands. Clear any `127.0.0.1` entries from Safari's history yourself.
+
+If you run it from a separate macOS account, run `--uninstall` as that account; everything it creates is in that account's home folder and container store. The WireGuard config is a credential: when you're done with the VPN account, revoke the config in your provider's dashboard too.
 
 ## Files
 

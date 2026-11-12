@@ -17,7 +17,7 @@
 # VPN=1 (default): all traffic goes through WireGuard with a kill switch. If
 # the tunnel fails, the browser does not start.
 #
-# Usage: ~/secure-browser [--open | --update | --check | --test | --stop | --reset-profile | --import-vpn]
+# Usage: ~/secure-browser [--open | --update | --check | --test | --stop | --reset-profile | --import-vpn | --uninstall]
 
 # ============================================================================
 # USER OPTIONS
@@ -59,6 +59,7 @@ ENABLE_AUDIO=1              # needs cocoa-way-audio-relay in the build folder
 set -euo pipefail
 umask 077
 SELF="${0:A}"                                         # how to refer to this script in messages
+SELF_PATH="$SELF"                                     # real path, used by --uninstall
 [[ "$SELF" == "$HOME/"* ]] && SELF="~/${SELF#$HOME/}"
 
 IMAGE="localhost/secure-browser-hardened:latest"
@@ -88,7 +89,8 @@ case "${1:-}" in
   --reset-profile) MODE=reset ;;
   --import-vpn) MODE=import ;;
   --open) MODE=open ;;
-  *) print -u2 "Usage: $SELF [--open | --update | --check | --test | --stop | --reset-profile | --import-vpn]"; exit 2 ;;
+  --uninstall) MODE=uninstall ;;
+  *) print -u2 "Usage: $SELF [--open | --update | --check | --test | --stop | --reset-profile | --import-vpn | --uninstall]"; exit 2 ;;
 esac
 (( $# <= 1 )) || { print -u2 'Only one option at a time.'; exit 2; }
 for flag in RESEARCH_MODE VPN INSTALL_PROTON_EXTENSION ENABLE_DOWNLOADS ALLOW_SITE_CLIPBOARD_API ENABLE_AUDIO; do
@@ -1344,6 +1346,100 @@ self_test() {
 }
 
 # ---------------------------------------------------------------------------
+# --uninstall: remove what this script created, from least to most. Each level
+# includes the ones before it. Never touches Apple Container itself, Homebrew
+# packages, the shared Debian base image, or your Downloads folder.
+uninstall() {
+  [[ -t 0 ]] || die '--uninstall is interactive; run it from a terminal.'
+  [[ -n "$HOME" && "$BASE" == "$HOME/.secure-browser-wayland" ]] || die 'Unexpected data folder; refusing to delete.'
+  local have_container=0; command -v container >/dev/null 2>&1 && have_container=1
+  info 'What do you want to remove? Each level includes the ones before it.'
+  info ''
+  info '  1  Session only        Stop the browser and delete its VM and the session state.'
+  info '                         Keeps the image, so the next launch is fast.'
+  info '  2  + Browser image     Also delete the built browser image, the build folder and'
+  info '                         stop the image builder. The next launch rebuilds (minutes).'
+  info '  3  + Data              Also delete the persistent profile volume (mode 0), the'
+  info "                         Cocoa-Way app-list entry, and the whole $BASE"
+  info '                         folder (update times, working VPN copy, logs).'
+  info '  4  + Everything        Also delete your saved WireGuard config'
+  info "                         ($WIREGUARD_CONF) and this script itself."
+  info ''
+  info '  Never removed: Apple Container, Homebrew packages, the Debian base image'
+  info "  (debian:trixie-slim), and $DOWNLOADS."
+  info ''
+  local level
+  printf 'Level [1-4, or q to quit]: '
+  IFS= read -r level || return 0
+  [[ "$level" == [1-4] ]] || { info 'Nothing removed.'; return 0; }
+
+  info ''
+  info "This will remove (level $level):"
+  info '  - the running browser session and its VM'
+  (( level >= 2 )) && info "  - the image $IMAGE, the build folder $BUILD, and the image builder"
+  if (( level >= 3 )); then
+    info "  - the persistent profile volume $PROFILE_VOLUME (extensions, logins, settings)"
+    info "  - the '$SESSION' entry in $CW_CONFIG (if present)"
+    info "  - the folder $BASE"
+  fi
+  if (( level >= 4 )); then
+    info "  - $WIREGUARD_CONF (your VPN credential)"
+    info "  - this script: $SELF_PATH"
+  fi
+  confirm 'Continue?' || { info 'Nothing removed.'; return 0; }
+  info ''
+
+  # Level 1: stop the session
+  (( have_container )) && stop_all || rm -f "$STATE/session.pw" "$STATE/running-research" "$STATE/running-viewer"
+  if (( have_container )); then
+    container delete "$RESEARCH_NAME" >/dev/null 2>&1 && info "Deleted container $RESEARCH_NAME."
+  fi
+
+  # Level 2: image, build folder, builder
+  if (( level >= 2 )); then
+    if (( have_container )); then
+      container image delete "$IMAGE" >/dev/null 2>&1 && info "Deleted image $IMAGE." || info "Image $IMAGE not present (or in use)."
+      container stop buildkit >/dev/null 2>&1 && info 'Stopped the image builder.'
+    fi
+    [[ -d "$BUILD" && ! -L "$BUILD" ]] && { rm -rf -- "$BUILD"; info "Deleted $BUILD."; }
+  fi
+
+  # Level 3: data
+  if (( level >= 3 )); then
+    if (( have_container )) && container volume inspect "$PROFILE_VOLUME" >/dev/null 2>&1; then
+      container volume delete "$PROFILE_VOLUME" >/dev/null 2>&1 && info "Deleted volume $PROFILE_VOLUME." ||
+        warn "Could not delete volume $PROFILE_VOLUME; run: container volume delete $PROFILE_VOLUME"
+    fi
+    if [[ -r "$CW_CONFIG" ]] && /usr/bin/grep -Fq "name = \"$SESSION\"" "$CW_CONFIG"; then
+      local work; work="$(mktemp "${TMPDIR:-/tmp}/secure-browser-cocoa.XXXXXX")"
+      cocoa_config_without_session > "$work"; chmod 600 "$work"; mv -f "$work" "$CW_CONFIG"
+      info "Removed the '$SESSION' entry from Cocoa-Way's app list."
+    fi
+    if [[ -d "$BASE" && ! -L "$BASE" ]]; then rm -rf -- "$BASE"; info "Deleted $BASE."; fi
+  fi
+
+  # Level 4: credential and the script
+  if (( level >= 4 )); then
+    if [[ -f "$WIREGUARD_CONF" ]]; then
+      rm -f -- "$WIREGUARD_CONF"; rmdir "${WIREGUARD_CONF:h}" 2>/dev/null || true
+      info "Deleted $WIREGUARD_CONF."
+      info '  If you are done with that VPN account, also revoke the config in your provider'"'"'s dashboard.'
+    fi
+  fi
+
+  info ''
+  info 'Done. Left in place:'
+  info '  - Apple Container (system-wide; remove it with Apple'"'"'s uninstall script from github.com/apple/container)'
+  info '  - the Debian base image: container image delete debian:trixie-slim  (only if nothing else uses it)'
+  [[ -d "$DOWNLOADS" ]] && info "  - your downloads folder: $DOWNLOADS"
+  info '  - Safari history entries for 127.0.0.1 (clear them in Safari)'
+  if (( level >= 4 )); then
+    rm -f -- "$SELF_PATH" && info "Deleted this script ($SELF_PATH)."
+  else
+    info "  - this script ($SELF); run $SELF --uninstall again and pick level 4 to remove it"
+  fi
+}
+
 main() {
   case "$MODE" in
     check)
@@ -1356,6 +1452,7 @@ main() {
         info "NO WireGuard config at $WIREGUARD_CONF (needed for VPN=1)"
       return $missing ;;
     stop) stop_all; return 0 ;;
+    uninstall) uninstall; return 0 ;;
     test) self_test; return 0 ;;
     import) import_vpn; return 0 ;;
     open)
