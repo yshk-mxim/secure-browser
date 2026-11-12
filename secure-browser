@@ -17,7 +17,7 @@
 # VPN=1 (default): all traffic goes through WireGuard with a kill switch. If
 # the tunnel fails, the browser does not start.
 #
-# Usage: ~/secure-browser [--update | --check | --test | --stop | --reset-profile | --import-vpn]
+# Usage: ~/secure-browser [--open | --update | --check | --test | --stop | --reset-profile | --import-vpn]
 
 # ============================================================================
 # USER OPTIONS
@@ -87,7 +87,8 @@ case "${1:-}" in
   --stop) MODE=stop ;;
   --reset-profile) MODE=reset ;;
   --import-vpn) MODE=import ;;
-  *) print -u2 "Usage: $SELF [--update | --check | --test | --stop | --reset-profile | --import-vpn]"; exit 2 ;;
+  --open) MODE=open ;;
+  *) print -u2 "Usage: $SELF [--open | --update | --check | --test | --stop | --reset-profile | --import-vpn]"; exit 2 ;;
 esac
 (( $# <= 1 )) || { print -u2 'Only one option at a time.'; exit 2; }
 for flag in RESEARCH_MODE VPN INSTALL_PROTON_EXTENSION ENABLE_DOWNLOADS ALLOW_SITE_CLIPBOARD_API ENABLE_AUDIO; do
@@ -736,7 +737,21 @@ if [ "$(id -u)" = 0 ]; then
       as_vnc env DISPLAY=:1 matchbox-window-manager -use_titlebar no >/dev/null 2>&1 &
     fi
     if [ "${SECURE_BROWSER_VIEWER:-safari}" = safari ]; then
-      as_vnc websockify --web /usr/share/novnc 6080 127.0.0.1:5901 >/run/vnc/websockify.log 2>&1 &
+      # Serve noVNC from a private copy with a start page, so the plain address
+      # http://127.0.0.1:6080/ opens the viewer instead of a file listing.
+      mkdir -p /run/vnc/web
+      for f in /usr/share/novnc/*; do ln -sf "$f" /run/vnc/web/; done
+      rm -f /run/vnc/web/index.html
+      cat > /run/vnc/web/index.html <<'INDEX'
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Secure Browser</title>
+<meta http-equiv="refresh" content="0; url=vnc.html#autoconnect=1&amp;reconnect=1&amp;resize=remote&amp;path=websockify">
+<script>location.replace("vnc.html#autoconnect=1&reconnect=1&resize=remote&path=websockify" +
+  (location.hash ? "&" + location.hash.slice(1) : ""));</script>
+</head><body><a href="vnc.html#autoconnect=1&amp;reconnect=1&amp;resize=remote&amp;path=websockify">Open the secure browser</a></body></html>
+INDEX
+      chmod 755 /run/vnc /run/vnc/web; chmod 644 /run/vnc/web/index.html
+      as_vnc websockify --web /run/vnc/web 6080 127.0.0.1:5901 >/run/vnc/websockify.log 2>&1 &
       sleep 1
     fi
   fi
@@ -975,17 +990,47 @@ vpn_args() {   # common container args for the VPN (prints one per line)
 research_running() { container list --quiet 2>/dev/null | /usr/bin/grep -qx "$RESEARCH_NAME"; }
 
 open_viewer() {   # open_viewer PORT PASSWORD [VIEWER]
-  local port="$1" pw="$2" viewer="${3:-$VIEWER}"
-  if [[ "$viewer" == safari ]]; then
-    # Password goes in the URL fragment, which noVNC reads locally and never sends to the server.
-    /usr/bin/open -a Safari \
-      "http://127.0.0.1:$port/vnc.html#autoconnect=1&reconnect=1&resize=remote&path=websockify&password=$pw"
-    info "Viewer: Safari at http://127.0.0.1:$port/vnc.html (password: $pw)"
+  local port="$1" pw="$2" viewer="${3:-$VIEWER}" link plain app
+  if [[ "$viewer" == screensharing ]]; then
+    link="vnc://:$pw@127.0.0.1:$port"; plain="vnc://127.0.0.1:$port"; app='Screen Sharing'
   else
-    /usr/bin/open "vnc://:$pw@127.0.0.1:$port"
-    info "Viewer: Screen Sharing at vnc://127.0.0.1:$port (password: $pw)"
-    info '  IMPORTANT: in Screen Sharing, turn OFF Edit > Use Shared Clipboard.'
+    # The password goes in the URL fragment (after #), which stays in the browser tab
+    # and is never sent to the server; noVNC reads it and logs you in.
+    link="http://127.0.0.1:$port/vnc.html#autoconnect=1&reconnect=1&resize=remote&path=websockify&password=$pw"
+    plain="http://127.0.0.1:$port"; app='Safari'
   fi
+
+  local opened=0
+  if [[ "$viewer" == screensharing ]]; then
+    /usr/bin/open "$link" >/dev/null 2>&1 && opened=1
+  else
+    /usr/bin/open -a Safari "$link" >/dev/null 2>&1 && opened=1
+  fi
+
+  if (( opened )); then
+    info "Opened $app (logged in automatically)."
+    [[ "$viewer" == screensharing ]] && info '  IMPORTANT: in Screen Sharing, turn OFF Edit > Use Shared Clipboard.'
+    return 0
+  fi
+
+  # No desktop session to open apps in (e.g. over SSH, or a user not logged in on
+  # screen). The session is running; show how to open it by hand.
+  info ''
+  info "Couldn't open $app automatically (no desktop session available to this terminal)."
+  info 'The research browser IS running. Open it in a browser on this Mac:'
+  info ''
+  if [[ "$viewer" == screensharing ]]; then
+    info "  In Screen Sharing (Finder > Go > Connect to Server), connect to:  $plain"
+    info "  Password:  $pw"
+    info '  Then turn OFF Edit > Use Shared Clipboard.'
+  else
+    info '  Easiest: paste this whole link into Safari (logs you in automatically):'
+    info "    $link"
+    info ''
+    info "  Or go to  $plain  and type the password:  $pw"
+  fi
+  info ''
+  info "  Later, from a terminal in your desktop session:  $SELF --open"
 }
 
 launch_research() {
@@ -1313,6 +1358,13 @@ main() {
     stop) stop_all; return 0 ;;
     test) self_test; return 0 ;;
     import) import_vpn; return 0 ;;
+    open)
+      # Reopen the viewer for the running session, already logged in. No checks, no rebuild.
+      if research_running && [[ -r "$STATE/session.pw" ]]; then
+        reopen_running_viewer; return 0
+      fi
+      info 'No research session is running; starting one.'
+      MODE=launch ;;
     reset)
       stop_all
       container volume inspect "$PROFILE_VOLUME" >/dev/null 2>&1 || { info 'No persistent profile to delete.'; return 0; }
@@ -1366,7 +1418,16 @@ main() {
     info '  Fresh start: nothing is kept; each session starts clean'
     info '  Hardening:   extra exploit protection (JavaScript JIT turned off)'
     info ''
+    if [[ -r "$STATE/session.pw" && -r "$STATE/running-viewer" ]]; then
+      local rv rp; read -r rv rp < "$STATE/running-viewer"
+      if [[ "$rv" == screensharing ]]; then
+        info "  Address:     vnc://127.0.0.1:$rp    Password: $(<"$STATE/session.pw")"
+      else
+        info "  Address:     http://127.0.0.1:$rp    Password: $(<"$STATE/session.pw")"
+      fi
+    fi
     info '  Shortcuts:   use Ctrl instead of Command (Ctrl-T new tab, Ctrl-L address bar)'
+    info "  Reopen:      $SELF --open   (logs you in; no need to type the password)"
     info "  To finish:   close the browser window, or run  $SELF --stop"
   else
     info 'Your browser is open in its own window (convenience mode).'

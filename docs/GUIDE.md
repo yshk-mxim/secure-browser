@@ -64,6 +64,28 @@ chmod 700 ~/secure-browser
 ~/secure-browser --check
 ```
 
+## Extra isolation: a separate macOS account (optional, recommended)
+
+Running `secure-browser` from its own macOS user account, apart from your main one, adds a layer on top of the VM and the hardened browser:
+
+1. **The browser** is sandboxed and hardened inside
+2. **The VM** (Apple Container) holds the browser and is deleted on exit
+3. **The macOS account** holds the VM, so a VM escape lands in an account with none of your files, keychain, browser profiles or logins
+
+How to set it up:
+
+1. Create a standard user in System Settings > Users & Groups (for example `research`). Don't sign in to iCloud or your real accounts there.
+2. Log in as that user (Fast User Switching keeps your main session running), then follow **Install** and the VPN steps above. Everything the launcher creates (`~/secure-browser`, `~/.secure-browser-wayland/`, the image, the VPN config) stays in that account's home folder.
+3. Apple Container's `.pkg` installs system-wide and needs an admin password. A standard user can't approve that: install or update it once from an admin account, or temporarily make the user an admin.
+4. Launch from that account. The viewer needs that account's desktop: stay logged in on screen, or connect with Screen Sharing. Over SSH the VM still starts, and the launcher prints a login link and password instead of opening Safari (see Troubleshooting).
+
+Know the limits:
+
+- The viewer is bound to `127.0.0.1` on the Mac, so other accounts on the same Mac can reach the port. They still need the random per-session password, which is stored in that account's `~/.secure-browser-wayland/state/session.pw` (private to it).
+- macOS account separation is a strong boundary but not a perfect one: local privilege-escalation bugs exist, so keep macOS updated.
+- The account only protects your *other* accounts. Anything you do inside the research account (logins, files) is exposed to the same attacker if the browser and VM are both compromised.
+- This setup hasn't been tested on real Macs yet.
+
 ## Set up the VPN (recommended)
 
 WireGuard doesn't use your Proton username or password. The config file is the credential:
@@ -156,6 +178,7 @@ So `auto` keeps the profile only for the Proton browser extension (`VPN=0`, `INS
 ```zsh
 ~/secure-browser            # check for updates, launch, open the viewer
 ~/secure-browser --test     # automated checks (see below)
+~/secure-browser --open     # reopen the viewer for the running session (already logged in)
 ~/secure-browser --stop     # end the session (the research VM is deleted)
 ~/secure-browser --update   # run all update checks now and rebuild
 ~/secure-browser --check    # dependency check, no changes
@@ -244,6 +267,7 @@ Then check by hand in the research browser:
 - **macOS asks "Allow 'container-runtime-linux' to find devices on local networks?"** Choose **Allow**. It's Apple Container's helper relaying the viewer from `127.0.0.1` on your Mac into the VM. Your home network stays blocked by the kill switch inside the VM either way. If you chose Don't Allow and the viewer won't load, turn it on in **System Settings > Privacy & Security > Local Network**.
 - **"Couldn't install Google Chrome":** Google's repository was unreachable or had no ARM64 package. The launcher offers Debian's Chromium for that build; set `BROWSER=chromium` to make that permanent.
 - **"Apple Container is still 1.x (wanted 1.y)" after an update:** you have two copies of the `container` command, usually an old Homebrew one (`/opt/homebrew/bin/container`) ahead of Apple's installed one (`/usr/local/bin/container`) in PATH. The launcher now detects this and offers to remove the Homebrew copy; your images and volumes are kept. To check by hand: `whence -ap container`.
+- **"Couldn't open Safari automatically" / "Domain does not support specified action":** macOS only lets a program open apps when it runs inside a logged-in desktop session. Over SSH, or from an account that isn't logged in on screen, it refuses. The browser VM is fine; only the automatic Safari step failed. The launcher prints a ready-to-use link that logs you in, plus the plain address and password. Paste the link into Safari while logged in on that Mac's screen (directly or through Screen Sharing), or run `~/secure-browser --open` from a Terminal in the desktop session. The password is also in `~/.secure-browser-wayland/state/session.pw`. The Screen Sharing viewer gets the same fallback.
 - **Viewer page doesn't load:** run `container logs secure-browser-research`. `secure-browser-vpn:` errors mean the kill switch kept the browser offline as designed. Check the WireGuard file, or test with `VPN=0`.
 - **"kernel lacks port-based routing rules":** the VM kernel can't run the viewer behind the kill switch. Please report it. As a temporary workaround, `VPN=0` works, but the browser can then reach your network.
 - **Wrong window size:** resize the Safari window. The viewer asks the VM to match it.

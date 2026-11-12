@@ -58,11 +58,22 @@ Then check everything once:
 ~/secure-browser --test
 ```
 
+## Extra isolation: run it from a separate Mac account
+
+For an additional barrier, install and run `secure-browser` in a **dedicated macOS user account**, separate from the one you use day to day (create one in System Settings > Users & Groups, and switch to it with Fast User Switching). Then the account, the Apple Container VM and the browser inside it are three nested layers. Even if a hostile page escaped the browser and the VM, it would land in an account with none of your files, keychain, browser profiles or logins, and macOS file permissions keep it away from your main account.
+
+- Do the install steps above while logged in as the dedicated account. Its images, volumes, VPN config and session state live in that account's home folder.
+- Apple Container's installer is system-wide and asks for an admin password. If the dedicated account isn't an admin, install or update Apple Container once from an admin account; the launcher will then find it.
+- Viewing needs a desktop session: be logged in on screen as that account (Fast User Switching or Screen Sharing). If you start it over SSH, or the launcher can't open Safari, it prints a ready-to-use login link and the password instead of stopping. Paste the link into Safari on that account's desktop, or run `~/secure-browser --open` from a Terminal there.
+- The viewer listens on `127.0.0.1` of the Mac, so other accounts on the same Mac can reach the port, but they still need the per-session password.
+- This is an extra layer, not a guarantee. Local privilege-escalation bugs in macOS exist, so keep macOS updated. Not yet tested on real Macs; see the limits below.
+
 ## Daily use
 
 | Command | What it does |
 |---|---|
 | `~/secure-browser` | Check for updates, start a session, open the viewer. If a session is already running, reopens its viewer; if that session is out of date, offers to restart it. |
+| `~/secure-browser --open` | Reopen the viewer for the running session, already logged in |
 | `~/secure-browser --stop` | End the session (the VM is deleted) |
 | `~/secure-browser --test` | Automated checks: tunnel, kill switch, exit IP, policy, isolation |
 | `~/secure-browser --update` | Run every update check now and rebuild |
