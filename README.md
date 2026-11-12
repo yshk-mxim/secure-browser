@@ -10,6 +10,8 @@ Google Chrome runs inside its own throwaway Linux virtual machine (Apple Contain
 
 > [!WARNING]
 > **Use at your own risk.** Provided "as is", with no warranty and no liability of any kind, including for security, privacy, anonymity, computer safety, data loss or intellectual property. It reduces risk; it does not guarantee protection. See [LICENSE](LICENSE).
+>
+> **Please don't just trust this.** Don't take the claims here on faith. Read the code (it's one script), and run your own security scans and audits before relying on it, as you would with any security tool. If you fork or deploy it, turn on GitHub's code scanning, secret scanning and Dependabot for your copy. Found a vulnerability? Please report it privately through this repo's private vulnerability reporting (Security tab), not as a public issue or pull request. See [SECURITY.md](SECURITY.md).
 
 ---
 
