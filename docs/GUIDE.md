@@ -72,18 +72,33 @@ Running `secure-browser` from its own macOS user account, apart from your main o
 2. **The VM** (Apple Container) holds the browser and is deleted on exit
 3. **The macOS account** holds the VM, so a VM escape lands in an account with none of your files, keychain, browser profiles or logins
 
-How to set it up:
+How to set it up (a standard user, reached over SSH, with no sudo):
 
-1. Create a standard user in System Settings > Users & Groups (for example `research`). Don't sign in to iCloud or your real accounts there.
-2. Log in as that user (Fast User Switching keeps your main session running), then follow **Install** and the VPN steps above. Everything the launcher creates (`~/secure-browser`, `~/.secure-browser-wayland/`, the image, the VPN config) stays in that account's home folder.
-3. Apple Container's `.pkg` installs system-wide and needs an admin password. A standard user can't approve that: install or update it once from an admin account, or temporarily make the user an admin.
-4. Launch from that account. The viewer needs that account's desktop: stay logged in on screen, or connect with Screen Sharing. Over SSH the VM still starts, and the launcher prints a login link and password instead of opening Safari (see Troubleshooting).
+1. **Create a Standard user** in System Settings > Users & Groups (for example `research`). Don't make it an Administrator: with no `sudo` access, a compromise of the account can't change the system. Don't sign in to iCloud or your real accounts there.
+2. **Turn on Remote Login** (System Settings > General > Sharing) and allow only that user.
+3. **Set up an SSH key** so you don't retype a password:
+   ```zsh
+   ssh-keygen -t ed25519 -f ~/.ssh/research_ed25519
+   ssh-copy-id -i ~/.ssh/research_ed25519.pub research@localhost
+   ```
+   Test the key, then consider turning off SSH password logins. An entry in `~/.ssh/config` shortens the command:
+   ```
+   Host research
+       HostName localhost
+       User research
+       IdentityFile ~/.ssh/research_ed25519
+   ```
+4. **Install over SSH** with `ssh -t research@localhost` (the `-t` gives the launcher a terminal for its prompts), then follow **Install** and the VPN steps above. Everything the launcher creates (`~/secure-browser`, `~/.secure-browser-wayland/`, the image, the VPN config) stays in that account's home folder.
+5. **Apple Container comes from an admin.** Its `.pkg` installs system-wide and needs an admin password, which this user doesn't have. Install it once from your admin account, and update it there too: a required security update blocks launch until an admin has applied it.
+6. **Launch over SSH:** `ssh -t research@localhost '~/secure-browser'`, or `ssh -t research '~/secure-browser'` with the config entry. The VM starts without a desktop, but the launcher can't open Safari from SSH, so it prints a login link and password (see Troubleshooting). Paste the link into Safari. To print it again, run `ssh -t research '~/secure-browser --open'`. To finish, run `ssh -t research '~/secure-browser --stop'`.
 
 Know the limits:
 
-- The viewer is bound to `127.0.0.1` on the Mac, so other accounts on the same Mac can reach the port. They still need the random per-session password, which is stored in that account's `~/.secure-browser-wayland/state/session.pw` (private to it).
+- **Where the viewer runs.** The viewer is bound to `127.0.0.1` on the Mac, so any account on the Mac can open it, with the random per-session password. Pasting the link into your *main* account's Safari is the most convenient, but then that Safari decodes the VM's video stream. For the most isolation, open the link in Safari on the research user's own desktop (log in as it with Fast User Switching or Screen Sharing).
+- The password is stored in the research account's `~/.secure-browser-wayland/state/session.pw`, private to it.
 - macOS account separation is a strong boundary but not a perfect one: local privilege-escalation bugs exist, so keep macOS updated.
 - The account only protects your *other* accounts. Anything you do inside the research account (logins, files) is exposed to the same attacker if the browser and VM are both compromised.
+- Remote Login exposes an SSH service. Allow only the research user, use key authentication, and turn Remote Login off when you don't need it.
 - This setup hasn't been tested on real Macs yet.
 
 ## Set up the VPN (recommended)
