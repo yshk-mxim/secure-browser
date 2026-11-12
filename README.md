@@ -131,4 +131,4 @@ Issues and pull requests are welcome, especially reports from different Mac mode
 
 ## License
 
-[MIT](LICENSE) © 2026 yshk-mxim. Free to use, change and share with attribution. **No warranty and no liability of any kind.** Chrome, Apple Container, Debian packages, noVNC, TigerVNC, WireGuard, Cocoa-Way and VPN services are third-party software under their own licenses and terms.
+[MIT](LICENSE) © 2026 Yakov Shkolnikov. Free to use, change and share with attribution. **No warranty and no liability of any kind.** Chrome, Apple Container, Debian packages, noVNC, TigerVNC, WireGuard, Cocoa-Way and VPN services are third-party software under their own licenses and terms.
