@@ -46,6 +46,7 @@ chmod 700 ~/secure-browser
 The first run:
 
 - installs or updates **Apple Container** from Apple's signed package, if needed (asks once, then asks for your admin password);
+- **may override Homebrew for security.** If your `container` command comes from Homebrew, the launcher offers to uninstall that copy (`brew uninstall container`) and replace it with Apple's signed, notarized package, so security fixes actually apply. It asks first, keeps your images and volumes, and won't launch if you decline. It never installs Homebrew, and only uses it if it's already there (for `RESEARCH_MODE=0`);
 - builds the browser VM image, which takes a few minutes;
 - opens Safari with the browser inside.
 
@@ -127,8 +128,8 @@ The [full guide](docs/GUIDE.md) covers every option, the VPN setup walkthrough, 
 
 ## Contributing
 
-Issues and pull requests are welcome, especially reports from different Mac models and macOS versions, Apple Container versions and VPN providers. When reporting a problem, include the output of `~/secure-browser --test`, with IP addresses removed.
+Issues and pull requests are welcome, especially reports from different Mac models and macOS versions, Apple Container versions and VPN providers. When reporting a problem, include the output of `~/secure-browser --test`, with IP addresses removed. For security vulnerabilities, don't use public issues or pull requests: report them privately as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
-[MIT](LICENSE) © 2026 yshk-mxim. Free to use, change and share with attribution. **No warranty and no liability of any kind.** Chrome, Apple Container, Debian packages, noVNC, TigerVNC, WireGuard, Cocoa-Way and VPN services are third-party software under their own licenses and terms.
+[MIT](LICENSE) © 2026 Yakov Shkolnikov. Free to use, change and share with attribution. **No warranty and no liability of any kind.** Chrome, Apple Container, Debian packages, noVNC, TigerVNC, WireGuard, Cocoa-Way and VPN services are third-party software under their own licenses and terms.
