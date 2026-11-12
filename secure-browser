@@ -1,0 +1,1382 @@
+#!/bin/zsh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 yshk-mxim. See LICENSE.
+# Provided "AS IS", WITHOUT WARRANTY OF ANY KIND, and without liability of any
+# kind (including security, computer safety, privacy and intellectual property).
+# Use at your own risk.
+#
+# Secure Chromium in an Apple Container VM.
+#
+# RESEARCH_MODE=1 (default): for exploring untrusted sites. The browser is
+#   shown as a pixel stream in Safari (noVNC) or macOS Screen Sharing. No
+#   clipboard sharing, no downloads, no persistence, JIT off, read-only system.
+#   Needs only Apple Container on the Mac.
+# RESEARCH_MODE=0: convenience mode. The browser appears as a native macOS
+#   window through Cocoa-Way (clipboard, downloads and audio available).
+#
+# VPN=1 (default): all traffic goes through WireGuard with a kill switch. If
+# the tunnel fails, the browser does not start.
+#
+# Usage: ~/secure-browser [--update | --check | --test | --stop | --reset-profile | --import-vpn]
+
+# ============================================================================
+# USER OPTIONS
+# ============================================================================
+RESEARCH_MODE=1
+#   1 = hardened pixel-streaming mode (overrides the convenience options below)
+#   0 = Cocoa-Way native window, with the convenience options below
+
+VIEWER=safari
+#   safari        = noVNC web viewer in Safari (recommended: Apple-patched, sandboxed)
+#   screensharing = macOS Screen Sharing. Turn OFF Edit > Use Shared Clipboard
+#                   in Screen Sharing every session.
+
+BROWSER=chrome
+#   chrome   = Google's official Chrome for ARM64 Linux, from Google's signed apt
+#              repository (same-day security fixes; recommended)
+#   chromium = Debian's Chromium build (open source; fixes can trail by days)
+#   If Chrome can't be installed, you're asked whether to fall back to Chromium.
+
+VPN=1
+#   1 = all browser traffic through WireGuard, kill switch, home network blocked
+#   0 = normal network
+WIREGUARD_CONF="$HOME/.config/secure-browser/wireguard.conf"
+
+# Automatic updates and security checks
+UPDATE_CHECK_HOURS=6        # How often to check Debian / Apple Container / Cocoa-Way
+MAX_IMAGE_AGE_DAYS=7        # Rebuild even without detected updates after this long
+
+# --- Convenience options: only used when RESEARCH_MODE=0 ---------------------
+PERSIST_PROFILE=auto        # auto = keep the profile ONLY when INSTALL_PROTON_EXTENSION=1
+                            #        (so its login survives); otherwise throwaway.
+                            # 1 = always keep (bookmarks, extensions); 0 = always throwaway
+INSTALL_PROTON_EXTENSION=0  # force-install Proton's browser extension
+ENABLE_DOWNLOADS=1          # downloads to ~/Downloads/secure-browser
+ALLOW_SITE_CLIPBOARD_API=1  # websites may request clipboard permission
+ENABLE_AUDIO=1              # needs cocoa-way-audio-relay in the build folder
+# ============================================================================
+
+set -euo pipefail
+umask 077
+SELF="${0:A}"                                         # how to refer to this script in messages
+[[ "$SELF" == "$HOME/"* ]] && SELF="~/${SELF#$HOME/}"
+
+IMAGE="localhost/secure-browser-hardened:latest"
+SESSION="Secure Chromium"                 # Cocoa-Way session name (mode 0)
+RESEARCH_NAME="secure-browser-research"   # container name (mode 1)
+PROFILE_VOLUME="secure-browser-profile"
+PROTON_ID="jplgfhpmjnbigmhklmmbgecoobifkmpa"
+VIEW_PORT_SAFARI=6080
+VIEW_PORT_SCREENSHARING=5901
+
+BASE="$HOME/.secure-browser-wayland"
+BUILD="$BASE/hardened-build"
+VPN_DIR="$BASE/vpn"
+STATE="$BASE/state"
+DOWNLOADS="$HOME/Downloads/secure-browser"
+CW_CONFIG="$HOME/.config/cocoa-way/container-sessions.toml"
+CW_LOG="$BASE/cocoa-way.log"
+AUDIO_RELAY="$BUILD/cocoa-way-audio-relay"
+
+MODE=launch
+case "${1:-}" in
+  "") ;;
+  --update) MODE=update ;;
+  --check) MODE=check ;;
+  --test) MODE=test ;;
+  --stop) MODE=stop ;;
+  --reset-profile) MODE=reset ;;
+  --import-vpn) MODE=import ;;
+  *) print -u2 "Usage: $SELF [--update | --check | --test | --stop | --reset-profile | --import-vpn]"; exit 2 ;;
+esac
+(( $# <= 1 )) || { print -u2 'Only one option at a time.'; exit 2; }
+for flag in RESEARCH_MODE VPN INSTALL_PROTON_EXTENSION ENABLE_DOWNLOADS ALLOW_SITE_CLIPBOARD_API ENABLE_AUDIO; do
+  [[ "${(P)flag}" == [01] ]] || { print -u2 "ERROR: $flag must be 0 or 1"; exit 2; }
+done
+[[ "$BROWSER" == (chrome|chromium) ]] || { print -u2 'ERROR: BROWSER must be chrome or chromium'; exit 2; }
+[[ "$VIEWER" == (safari|screensharing) ]] || { print -u2 'ERROR: VIEWER must be safari or screensharing'; exit 2; }
+[[ "$PERSIST_PROFILE" == (auto|0|1) ]] || { print -u2 'ERROR: PERSIST_PROFILE must be auto, 0 or 1'; exit 2; }
+[[ "$MAX_IMAGE_AGE_DAYS" == <-> && "$UPDATE_CHECK_HOURS" == <-> ]] || { print -u2 'ERROR: ages must be numbers'; exit 2; }
+
+# Research mode overrides every convenience switch.
+if (( RESEARCH_MODE )); then
+  PERSIST_PROFILE=0; INSTALL_PROTON_EXTENSION=0; ENABLE_DOWNLOADS=0
+  ALLOW_SITE_CLIPBOARD_API=0; ENABLE_AUDIO=0
+fi
+
+info() { print -r -- "$*"; }
+warn() { print -r -- "WARNING: $*"; }
+die()  { print -ru2 -- "ERROR: $*"; exit 1; }
+
+confirm() {
+  local answer
+  [[ -t 0 ]] || { info "(non-interactive: answering no to: $1)"; return 1; }
+  printf '%s [y/N] ' "$1"
+  IFS= read -r answer || return 1
+  [[ "$answer" == ([Yy]|[Yy][Ee][Ss]) ]]
+}
+
+ver_lt() {   # ver_lt A B: true if version A < version B
+  /usr/bin/awk -v a="$1" -v b="$2" 'BEGIN {
+    na = split(a, x, "."); nb = split(b, y, "."); n = (na > nb ? na : nb)
+    for (i = 1; i <= n; i++) { if ((x[i]+0) < (y[i]+0)) exit 0; if ((x[i]+0) > (y[i]+0)) exit 1 }
+    exit 1 }'
+}
+first_semver() { /usr/bin/grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | /usr/bin/head -n1 || true; }
+
+stamp_fresh() {   # stamp_fresh NAME HOURS: true if NAME was touched less than HOURS ago
+  local f="$STATE/$1" t=0
+  [[ -r "$f" ]] && t="$(<"$f")"
+  [[ "$t" == <-> ]] || t=0
+  (( $(/bin/date +%s) - t < $2 * 3600 ))
+}
+stamp() { mkdir -p "$STATE"; /bin/date +%s > "$STATE/$1"; }
+
+# ---------------------------------------------------------------------------
+# Host dependencies
+# ---------------------------------------------------------------------------
+# Homebrew is optional everywhere. It is used only if already installed, and
+# only for Cocoa-Way (RESEARCH_MODE=0). Research mode never needs it.
+have_brew() {
+  command -v brew >/dev/null 2>&1 && return 0
+  [[ -x /opt/homebrew/bin/brew ]] && { eval "$(/opt/homebrew/bin/brew shellenv)"; return 0; }
+  return 1
+}
+cocoa_from_brew() { have_brew && brew list --formula cocoa-way >/dev/null 2>&1; }
+
+PKG_CONTAINER=/usr/local/bin/container   # where Apple's signed installer puts the CLI
+REPLACE_BREW_APPROVED=0
+
+# A second 'container' command earlier in PATH (usually Homebrew's) would keep
+# running the old version, including the background services it starts, so an
+# update would appear to do nothing. Detect it and fix it.
+fix_container_path() {
+  rehash
+  local all=() b first brew_owned=''
+  all=(${(u)${(f)"$(whence -ap container 2>/dev/null)"}})   # (u): PATH may list a folder twice
+  (( ${#all} )) || return 0
+  first="${all[1]}"
+  [[ -x "$PKG_CONTAINER" ]] || return 0
+  [[ "$first" -ef "$PKG_CONTAINER" ]] && return 0
+  info ''
+  info "More than one Apple Container 'container' command was found:"
+  for b in "${all[@]}"; do info "  $b  (version $("$b" --version 2>/dev/null | first_semver))"; done
+  info "  '$first' runs first, so the Apple-installed copy ($PKG_CONTAINER) is being ignored."
+  if command -v brew >/dev/null 2>&1 && [[ "$first" == "$(brew --prefix)"/* ]]; then
+    if brew list --formula container >/dev/null 2>&1; then brew_owned=formula
+    elif brew list --cask container >/dev/null 2>&1; then brew_owned=cask; fi
+  fi
+  if [[ -n "$brew_owned" ]]; then
+    (( REPLACE_BREW_APPROVED )) ||
+    confirm "Remove the old Homebrew copy (brew uninstall --$brew_owned container) so Apple's installed one is used? Your images and volumes are kept." ||
+      die "Not launching with the old copy first in PATH. Remove '$first' or put /usr/local/bin first in PATH, then rerun."
+    info 'Stopping the services the old copy started...'
+    container system stop >/dev/null 2>&1 || true
+    brew uninstall "--$brew_owned" container
+    rehash
+    [[ "$(whence -p container)" -ef "$PKG_CONTAINER" ]] || die "Still not using $PKG_CONTAINER; check your PATH."
+    info "Now using $PKG_CONTAINER (version $(container --version 2>/dev/null | first_semver))."
+    return 0
+  fi
+  die "Remove or rename '$first', or put /usr/local/bin before its folder in PATH, then rerun."
+}
+
+ensure_host_prerequisites() {
+  [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || die 'Needs macOS on Apple silicon.'
+  local major; major="$(/usr/bin/sw_vers -productVersion | /usr/bin/cut -d. -f1)"
+  (( major >= 26 )) || die 'Apple Container needs macOS 26 or newer.'
+  # Prefer Apple's official signed package everywhere. On first run this
+  # installs it if missing, or replaces a Homebrew copy with it (one question).
+  rehash
+  local cur; cur="$(whence -p container 2>/dev/null || true)"
+  if [[ -z "$cur" ]]; then
+    info 'Apple Container is not installed.'
+    confirm "Install it now from Apple's official signed package? (asks for your admin password)" ||
+      die 'Apple Container is required. Install it from https://github.com/apple/container/releases and rerun.'
+    install_latest_apple_container || die 'Installation failed. Install the .pkg from https://github.com/apple/container/releases and rerun.'
+  elif [[ ! -x "$PKG_CONTAINER" ]] && have_brew && [[ "$cur" == "$(brew --prefix)"/* ]]; then
+    info "Apple Container is installed through Homebrew ($cur)."
+    info "Apple's official signed package is preferred: it is verified by Apple's signature and notarization."
+    confirm "Replace it with Apple's official package now? Your images and volumes are kept. (asks for your admin password)" ||
+      die 'Keeping Homebrew Apple Container is not supported by this launcher. Rerun when ready to switch.'
+    REPLACE_BREW_APPROVED=1
+    install_latest_apple_container || die 'Installation failed; your Homebrew copy is unchanged.'
+  fi
+  fix_container_path
+
+  (( RESEARCH_MODE )) && return 0   # pixel streaming needs nothing else on the Mac
+
+  local missing=()
+  command -v cocoa-way    >/dev/null 2>&1 || missing+=(J-x-Z/tap/cocoa-way)
+  command -v cocoa-wayctl >/dev/null 2>&1 || missing+=(J-x-Z/tap/cocoa-way)
+  command -v waypipe      >/dev/null 2>&1 || missing+=(J-x-Z/tap/waypipe-darwin)
+  if (( ${#missing} )); then
+    missing=(${(u)missing})
+    if ! have_brew; then
+      info 'RESEARCH_MODE=0 needs Cocoa-Way and Waypipe, which are distributed through Homebrew'
+      info '(or as source code: https://github.com/J-x-Z/cocoa-way). Homebrew is not installed, and'
+      info 'this script will not install it for you.'
+      die 'Use RESEARCH_MODE=1 (the default; needs nothing but Apple Container), or install Cocoa-Way yourself.'
+    fi
+    info 'Cocoa-Way and Waypipe come from the third-party J-x-Z/tap (https://github.com/J-x-Z/cocoa-way).'
+    info "Installing by full name trusts only these formulae: ${missing[*]}"
+    confirm 'Install them with Homebrew?' || die 'Cocoa-Way is required for RESEARCH_MODE=0.'
+    brew install "${missing[@]}"
+  fi
+  local t
+  for t in cocoa-way cocoa-wayctl waypipe; do command -v "$t" >/dev/null 2>&1 || die "Missing $t."; done
+}
+
+# ---------------------------------------------------------------------------
+# Security update checks (GitHub advisories + release notes)
+# ---------------------------------------------------------------------------
+gh_api() {   # gh_api PATH -> JSON on stdout, or fails
+  /usr/bin/curl -fsS --max-time 15 -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2022-11-28' "https://api.github.com/$1"
+}
+
+# Prints one line per security-relevant item newer than INSTALLED:
+#   ADVISORY|id|severity|patched-version-or-none
+#   RELEASE|tag|security-fix-mentioned(0/1)
+security_items() {   # security_items OWNER/REPO INSTALLED
+  local adv rel
+  adv="$(gh_api "repos/$1/security-advisories?state=published&per_page=100" 2>/dev/null || print '[]')"
+  rel="$(gh_api "repos/$1/releases?per_page=30" 2>/dev/null)" || return 1
+  /usr/bin/osascript -l JavaScript -e '
+    function vlt(a, b) {
+      var x = a.split("."), y = b.split(".");
+      for (var i = 0; i < Math.max(x.length, y.length); i++) {
+        var p = parseInt(x[i] || "0", 10), q = parseInt(y[i] || "0", 10);
+        if (p < q) return true; if (p > q) return false;
+      }
+      return false;
+    }
+    function ver(s) { var m = String(s || "").match(/[0-9]+\.[0-9]+(\.[0-9]+)?/); return m ? m[0] : ""; }
+    function run(a) {
+      var inst = a[2], out = [], adv = [], rel = [];
+      try { adv = JSON.parse(a[0]); } catch (e) {}
+      try { rel = JSON.parse(a[1]); } catch (e) { return "ERROR"; }
+      if (!Array.isArray(adv)) adv = [];
+      if (!Array.isArray(rel)) return "ERROR";
+      adv.forEach(function (x) {
+        var vulns = x.vulnerabilities || [];
+        if (!vulns.length) vulns = [{}];
+        vulns.forEach(function (v) {
+          var p = ver(v.patched_versions);
+          if (!p || vlt(inst, p))
+            out.push(["ADVISORY", x.cve_id || x.ghsa_id || "?", x.severity || "?", p || "none"].join("|"));
+        });
+      });
+      rel.forEach(function (r) {
+        if (r.draft || r.prerelease) return;
+        var v = ver(r.tag_name);
+        if (v && vlt(inst, v)) {
+          var sec = /GHSA-[0-9a-z]{4}-|CVE-[0-9]{4}-|security fix|vulnerab/i.test(r.body || "") ? 1 : 0;
+          out.push(["RELEASE", v, sec].join("|"));
+        }
+      });
+      return out.join("\n");
+    }' "$adv" "$rel" "$2" 2>/dev/null
+}
+
+# Download, verify and install the latest signed Apple Container package.
+# Verification: GitHub's published SHA-256 for the file (when listed), Apple's
+# installer signature (pkgutil) and Gatekeeper notarization (spctl).
+install_latest_apple_container() {
+  local json meta ver name url digest dir pkg sig signer got
+  json="$(gh_api repos/apple/container/releases/latest)" || { warn 'Could not reach GitHub to download the update.'; return 1; }
+  meta="$(/usr/bin/osascript -l JavaScript -e '
+    function run(a) {
+      try {
+        var r = JSON.parse(a[0]), assets = r.assets || [];
+        var pick = assets.filter(function (x) { return /signed.*\.pkg$/i.test(x.name); })[0] ||
+                   assets.filter(function (x) { return /\.pkg$/i.test(x.name); })[0];
+        if (!pick) return "";
+        var v = (String(r.tag_name).match(/[0-9]+\.[0-9]+(\.[0-9]+)?/) || [""])[0];
+        return [v, pick.name, pick.browser_download_url, pick.digest || ""].join("|");
+      } catch (e) { return ""; }
+    }' "$json" 2>/dev/null || true)"
+  IFS='|' read -r ver name url digest <<< "$meta"
+  [[ -n "$url" && "$url" == https://github.com/apple/container/releases/download/* ]] ||
+    { warn 'No signed installer package found in the latest Apple Container release.'; return 1; }
+  [[ "$name" != */* && "$name" == *.pkg ]] || { warn "Unexpected package name '$name'."; return 1; }
+
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/apple-container-update.XXXXXX")"
+  pkg="$dir/$name"
+  info "Downloading $name (Apple Container $ver)..."
+  /usr/bin/curl -fSL --progress-bar --proto '=https' --tlsv1.2 --max-time 600 -o "$pkg" "$url" ||
+    { rm -f "$pkg"; rmdir "$dir"; warn 'Download failed.'; return 1; }
+
+  if [[ "$digest" == sha256:* ]]; then
+    got="$(/usr/bin/shasum -a 256 "$pkg" | /usr/bin/awk '{print $1}')"
+    [[ "sha256:$got" == "$digest" ]] ||
+      { rm -f "$pkg"; rmdir "$dir"; warn 'Checksum does not match what GitHub published. Not installing.'; return 1; }
+    info '  Checksum matches the release.'
+  else
+    info '  (GitHub lists no checksum for this file; relying on Apple signature checks.)'
+  fi
+
+  sig="$(/usr/sbin/pkgutil --check-signature "$pkg" 2>&1 || true)"
+  if ! print -r -- "$sig" | /usr/bin/grep -q 'signed by a developer certificate issued by Apple' ||
+     ! /usr/sbin/spctl --assess --type install "$pkg" >/dev/null 2>&1; then
+    rm -f "$pkg"; rmdir "$dir"
+    warn 'The package is not signed and notarized as expected. Not installing.'
+    return 1
+  fi
+  signer="$(print -r -- "$sig" | /usr/bin/awk '/^ *1\. /{sub(/^ *1\. /,""); print; exit}')"
+  info "  Signed and notarized. Signer: ${signer:-unknown}"
+  if [[ "$signer" != *"Apple Inc."* ]]; then
+    confirm "The signer is not 'Apple Inc.'. Install anyway?" || { rm -f "$pkg"; rmdir "$dir"; return 1; }
+  fi
+
+  info 'Stopping Apple Container (running containers stop)...'
+  container system stop >/dev/null 2>&1 || true
+  info 'Installing. macOS will ask for your admin password:'
+  if ! /usr/bin/sudo /usr/sbin/installer -pkg "$pkg" -target /; then
+    rm -f "$pkg"; rmdir "$dir"
+    container system start >/dev/null 2>&1 || true
+    warn 'The installer did not complete.'
+    return 1
+  fi
+  rm -f "$pkg"; rmdir "$dir"
+  fix_container_path            # make sure the freshly installed copy is the one that runs
+  info 'Starting Apple Container...'
+  container system start || { warn 'Apple Container did not start after the update.'; return 1; }
+}
+
+check_apple_container() {
+  local inst items latest sec_rel adv_lines unfixed
+  inst="$(container --version 2>/dev/null | first_semver)"
+  [[ -n "$inst" ]] || { warn 'Could not read the Apple Container version.'; return 0; }
+  items="$(security_items apple/container "$inst")" || { warn 'Could not check Apple Container updates (offline?).'; return 0; }
+  [[ "$items" != ERROR ]] || { warn 'Unexpected GitHub response for Apple Container.'; return 0; }
+  latest="$(print -r -- "$items" | /usr/bin/awk -F'|' '$1=="RELEASE"{print $2; exit}')"
+  sec_rel="$(print -r -- "$items" | /usr/bin/awk -F'|' '$1=="RELEASE" && $3==1 {print $2}' | /usr/bin/paste -sd, - || true)"
+  adv_lines="$(print -r -- "$items" | /usr/bin/awk -F'|' '$1=="ADVISORY" && $4!="none" {print "  " $2 " (" $3 ", fixed in " $4 ")"}')"
+  unfixed="$(print -r -- "$items" | /usr/bin/awk -F'|' '$1=="ADVISORY" && $4=="none" {print "  " $2 " (" $3 ", no fix released yet)"}')"
+  if [[ -n "$unfixed" ]]; then
+    warn 'Apple Container has published advisories with NO fix available yet:'
+    info "$unfixed"
+    info '  Read them before browsing hostile sites: https://github.com/apple/container/security/advisories'
+    confirm 'Continue anyway?' || exit 1
+  fi
+
+  if [[ -n "$sec_rel$adv_lines" ]]; then
+    info "Apple Container $inst has security fixes available (security releases: ${sec_rel:-see advisories})."
+    [[ -n "$adv_lines" ]] && info "$adv_lines"
+    info 'The VM boundary depends on Apple Container, so it must be updated before launching.'
+    confirm "Download and install Apple Container ${latest:-latest} now? (stops running containers; asks for your admin password)" ||
+      die 'Not launching with a vulnerable Apple Container. Rerun when you are ready to update.'
+    if ! install_latest_apple_container; then
+      if [[ -x /usr/local/bin/update-container.sh ]] && confirm "Try Apple's own updater script instead?"; then
+        container system stop >/dev/null 2>&1 || true
+        /usr/local/bin/update-container.sh || true
+        container system start || true
+      else
+        die 'Automatic update failed. Install the latest .pkg from https://github.com/apple/container/releases and rerun.'
+      fi
+    fi
+    rehash
+    inst="$(container --version 2>/dev/null | first_semver)"
+    if [[ -n "$latest" ]] && ver_lt "${inst:-0}" "$latest"; then
+      info "The 'container' command in use is $(whence -p container) (version ${inst:-unknown})."
+      [[ -x "$PKG_CONTAINER" ]] && info "Apple's installed copy $PKG_CONTAINER reports $("$PKG_CONTAINER" --version 2>/dev/null | first_semver)."
+      die "Apple Container in use is still ${inst:-unknown} (wanted $latest). Not launching."
+    fi
+    info "Apple Container updated to $inst."
+  elif [[ -n "$latest" ]]; then
+    info "Apple Container $inst: newer release $latest available (no security fixes listed)."
+    confirm "Update to $latest now anyway?" && { install_latest_apple_container || warn 'Update failed; continuing with the current version.'; }
+  fi
+}
+
+check_cocoa_way() {
+  local outdated inst items adv managed=0
+  if cocoa_from_brew; then
+    managed=1
+    outdated="$(brew outdated --quiet J-x-Z/tap/cocoa-way J-x-Z/tap/waypipe-darwin 2>/dev/null || true)"
+    if [[ -n "$outdated" ]]; then
+      info "Updating the Cocoa-Way bridge (it handles untrusted data on the Mac side): ${(f)outdated}"
+      brew upgrade J-x-Z/tap/cocoa-way J-x-Z/tap/waypipe-darwin || die 'Cocoa-Way update failed; use RESEARCH_MODE=1 until it succeeds.'
+    fi
+    inst="$(brew list --versions cocoa-way 2>/dev/null | first_semver)"
+  else
+    inst="$(cocoa-way --version 2>/dev/null | first_semver)"
+  fi
+  [[ -n "$inst" ]] || { warn 'Could not read the Cocoa-Way version; skipping its security check.'; return 0; }
+  items="$(security_items J-x-Z/cocoa-way "$inst")" || { warn 'Could not check Cocoa-Way advisories (offline?).'; return 0; }
+  adv="$(print -r -- "$items" | /usr/bin/awk -F'|' '($1=="ADVISORY") || ($1=="RELEASE" && $3==1) {print "  " $0}')"
+  if [[ -n "$adv" ]]; then
+    if (( managed )); then
+      info "Cocoa-Way $inst still has unfixed security issues after updating:"
+    else
+      info "Cocoa-Way $inst (not installed with Homebrew, so it can't be updated automatically) has security fixes pending:"
+    fi
+    info "$adv"
+    die 'Refusing to use the Cocoa-Way bridge. Set RESEARCH_MODE=1 (no Cocoa-Way needed), or update Cocoa-Way and rerun.'
+  fi
+}
+
+run_security_checks() {
+  local force="$1"
+  if (( force )) || ! stamp_fresh host-checks "$UPDATE_CHECK_HOURS"; then
+    info 'Checking Apple Container for security updates...'
+    check_apple_container
+    if (( ! RESEARCH_MODE )); then
+      info 'Checking the Cocoa-Way bridge for updates and advisories...'
+      check_cocoa_way
+    fi
+    stamp host-checks
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# WireGuard config (host side)
+# ---------------------------------------------------------------------------
+VPN_ON=0
+VPN_DNS=''
+
+conf_values() {   # conf_values KEY FILE -> one value per line
+  /usr/bin/awk -v key="$1" '
+    { line = $0; sub(/#.*/, "", line) }
+    tolower(line) ~ "^[[:space:]]*" tolower(key) "[[:space:]]*=" {
+      sub(/^[^=]*=/, "", line); n = split(line, parts, ",")
+      for (i = 1; i <= n; i++) { gsub(/[[:space:]]/, "", parts[i]); if (parts[i] != "") print parts[i] }
+    }' "$2"
+}
+
+# Save the WireGuard text that Proton shows on screen (there is no file to
+# download). Reads the clipboard, or standard input if piped. The file is
+# created private (600) from the start, checked, and the clipboard is cleared.
+import_vpn() {
+  local dir="${WIREGUARD_CONF:h}" tmp from_clipboard=0
+  [[ ! -L "$WIREGUARD_CONF" ]] || die 'WireGuard config path must not be a symlink.'
+  mkdir -p "$dir"; chmod 700 "$dir"
+  tmp="$(mktemp "$dir/.wireguard-import.XXXXXX")"        # mktemp creates it as 600
+  if [[ -t 0 ]]; then
+    info 'In Proton, select the whole config text (from [Interface] to the last line) and copy it.'
+    printf 'Press Return when it is copied (Ctrl-C to cancel)... '
+    IFS= read -r _ || { rm -f "$tmp"; die 'Cancelled.'; }
+    /usr/bin/pbpaste > "$tmp"
+    from_clipboard=1
+  else
+    cat > "$tmp"
+  fi
+  # Remove Windows line endings and stray spaces that web pages sometimes add.
+  /usr/bin/sed -i '' -e $'s/\r$//' -e 's/^[[:space:]]*//' "$tmp"
+  local problem=''
+  /usr/bin/grep -qi '^\[Interface\]' "$tmp"              || problem='no [Interface] section'
+  /usr/bin/grep -qi '^PrivateKey[[:space:]]*=' "$tmp"     || problem="${problem:+$problem, }no PrivateKey"
+  /usr/bin/grep -qi '^\[Peer\]' "$tmp"                   || problem="${problem:+$problem, }no [Peer] section"
+  /usr/bin/grep -qi '^Endpoint[[:space:]]*=' "$tmp"       || problem="${problem:+$problem, }no Endpoint"
+  if [[ -n "$problem" ]]; then
+    rm -f "$tmp"
+    die "That doesn't look like a complete WireGuard config ($problem). Copy all of it and try again."
+  fi
+  if [[ -e "$WIREGUARD_CONF" ]] && ! /usr/bin/cmp -s "$tmp" "$WIREGUARD_CONF"; then
+    confirm "Replace the existing $WIREGUARD_CONF?" || { rm -f "$tmp"; info 'Kept the existing config.'; return 0; }
+  fi
+  mv -f "$tmp" "$WIREGUARD_CONF"
+  chmod 600 "$WIREGUARD_CONF"
+  if (( from_clipboard )); then
+    /usr/bin/pbcopy < /dev/null
+    info 'Clipboard cleared (it held your private key).'
+  fi
+  prepare_vpn >/dev/null    # full validation (endpoint, DNS) using the same checks as launch
+  info "Saved: $WIREGUARD_CONF (private to you)."
+  info "Next: $SELF --test"
+}
+
+prepare_vpn() {
+  VPN_ON=0
+  (( VPN )) || return 0
+  if [[ ! -r "$WIREGUARD_CONF" ]]; then
+    info ''
+    info "VPN=1 but no WireGuard config was found at: $WIREGUARD_CONF"
+    info '  1. Sign in at https://account.protonvpn.com > Downloads > WireGuard configuration'
+    info '  2. Name it, Platform: GNU/Linux, NAT-PMP off, pick a server, click Create.'
+    info "  3. Copy the config text Proton shows, then run: $SELF --import-vpn"
+    info "  Any WireGuard provider's config works. Or set VPN=0."
+    confirm 'Launch WITHOUT the VPN this time? (sites will see your real IP)' || exit 1
+    return 0
+  fi
+  [[ ! -L "$WIREGUARD_CONF" ]] || die 'WireGuard config must not be a symlink.'
+  /usr/bin/grep -qi '^[[:space:]]*\[Interface\]' "$WIREGUARD_CONF" &&
+  /usr/bin/grep -qi '^[[:space:]]*PrivateKey[[:space:]]*=' "$WIREGUARD_CONF" &&
+  /usr/bin/grep -qi '^[[:space:]]*\[Peer\]' "$WIREGUARD_CONF" ||
+    die "$WIREGUARD_CONF does not look like a WireGuard config."
+  local ep; ep="$(conf_values Endpoint "$WIREGUARD_CONF" | /usr/bin/head -n1)"
+  [[ "$ep" =~ '^[0-9]+(\.[0-9]+){3}:[0-9]+$' ]] ||
+    die "Endpoint must be an IPv4 address and port (got '$ep'). Proton configs already are."
+  VPN_DNS="$(conf_values DNS "$WIREGUARD_CONF" | /usr/bin/grep -E '^[0-9]+(\.[0-9]+){3}$' | /usr/bin/head -n1 || true)"
+  [[ -n "$VPN_DNS" ]] || die 'WireGuard config has no IPv4 DNS line.'
+  conf_values AllowedIPs "$WIREGUARD_CONF" | /usr/bin/grep -qx '0.0.0.0/0' ||
+    warn 'AllowedIPs lacks 0.0.0.0/0, so some sites will fail (the kill switch stops leaks).'
+  local perms; perms="$(/usr/bin/stat -f '%Lp' "$WIREGUARD_CONF")"
+  [[ "$perms" == ?00 ]] || warn "$WIREGUARD_CONF is readable by other users; run: chmod 600 '$WIREGUARD_CONF'"
+  mkdir -p "$VPN_DIR"; chmod 700 "$VPN_DIR"
+  /usr/bin/cmp -s "$WIREGUARD_CONF" "$VPN_DIR/wireguard.conf" 2>/dev/null ||
+    /bin/cp -f "$WIREGUARD_CONF" "$VPN_DIR/wireguard.conf"
+  chmod 600 "$VPN_DIR/wireguard.conf"
+  VPN_ON=1
+}
+
+profile_persistent() {
+  # A kept profile lets tampering survive restarts and links sessions together,
+  # so 'auto' keeps it only for the one thing that needs it: the extension login.
+  case "$PERSIST_PROFILE" in 1) return 0 ;; 0) return 1 ;; auto) (( INSTALL_PROTON_EXTENSION )) ;; esac
+}
+audio_on() { (( ENABLE_AUDIO )) && [[ -f "$AUDIO_RELAY" ]]; }
+view_port() { [[ "$VIEWER" == safari ]] && print "$VIEW_PORT_SAFARI" || print "$VIEW_PORT_SCREENSHARING"; }
+
+# ---------------------------------------------------------------------------
+# Image build context
+# ---------------------------------------------------------------------------
+write_build_context() {
+  mkdir -p "$BUILD"; chmod 700 "$BUILD"
+  local download_policy=3 clipboard_policy=2 jit=1 ext=''
+  (( ENABLE_DOWNLOADS )) && download_policy=1          # 1 = block known-dangerous files
+  (( ALLOW_SITE_CLIPBOARD_API )) && clipboard_policy=3
+  (( RESEARCH_MODE )) && jit=2                           # 2 = JavaScript JIT off everywhere
+  if (( INSTALL_PROTON_EXTENSION )); then
+    ext=",
+  \"ExtensionSettings\": {
+    \"$PROTON_ID\": {
+      \"installation_mode\": \"force_installed\",
+      \"update_url\": \"https://clients2.google.com/service/update2/crx\"
+    }
+  }"
+  fi
+
+  cat > "$BUILD/secure-browser-policy.json" <<POLICY
+{
+  "BrowserSignin": 0,
+  "SyncDisabled": true,
+  "PasswordManagerEnabled": false,
+  "AutofillAddressEnabled": false,
+  "AutofillCreditCardEnabled": false,
+  "BlockThirdPartyCookies": true,
+  "DownloadRestrictions": $download_policy,
+  "DefaultClipboardSetting": $clipboard_policy,
+  "DefaultJavaScriptJitSetting": $jit,
+  "HttpsOnlyMode": "force_enabled",
+  "NetworkPredictionOptions": 2,
+  "SearchSuggestEnabled": false,
+  "AlternateErrorPagesEnabled": false,
+  "SpellCheckServiceEnabled": false,
+  "MetricsReportingEnabled": false,
+  "BackgroundModeEnabled": false,
+  "SavingBrowserHistoryDisabled": true,
+  "RestoreOnStartup": 5,
+  "DiskCacheSize": 268435456,
+  "ClearBrowsingDataOnExitList": [
+    "browsing_history", "download_history", "cookies_and_other_site_data",
+    "cached_images_and_files", "autofill", "password_signin"
+  ],
+  "DefaultGeolocationSetting": 2,
+  "DefaultNotificationsSetting": 2,
+  "AudioCaptureAllowed": false,
+  "VideoCaptureAllowed": false,
+  "DefaultSensorsSetting": 2,
+  "DefaultWebBluetoothGuardSetting": 2,
+  "DefaultWebUsbGuardSetting": 2,
+  "DefaultWebHidGuardSetting": 2,
+  "DefaultSerialGuardSetting": 2,
+  "DefaultInsecureContentSetting": 2,
+  "WebRtcIPHandling": "disable_non_proxied_udp",
+  "QuicAllowed": false$ext
+}
+POLICY
+
+  # --- WireGuard + route-based kill switch (guest root) ---
+  cat > "$BUILD/secure-browser-vpn-up" <<'VPNUP'
+#!/bin/sh
+# Fail-closed WireGuard setup using routes only (no iptables/nftables needed).
+# Afterwards the only ways out of the VM are:
+#   * wg0 (everything), and one host route to the VPN server;
+#   * if SECURE_BROWSER_PUBLISHED_PORT is set: TCP *replies* from that one
+#     listening port back to the Mac, so the viewer works. A policy rule
+#     matches TCP source port only; the port is held by the viewer service
+#     (separate user), so the browser cannot use it to reach the Mac.
+set -eu
+CONF=/root/secure-browser-vpn/wireguard.conf
+WG=wg0
+PUB="${SECURE_BROWSER_PUBLISHED_PORT:-}"
+log()  { echo "secure-browser-vpn: $*" >&2; }
+fail() { log "ERROR: $*"; exit 1; }
+
+[ "$(id -u)" = 0 ] || fail "must start as root"
+[ -r "$CONF" ] || fail "config not mounted at $CONF"
+umask 077
+work=$(mktemp -d /run/.sbvpn.XXXXXX)
+trap 'rm -rf "$work"' EXIT
+
+vals() {
+  awk -v key="$1" '
+    { line = $0; sub(/#.*/, "", line) }
+    tolower(line) ~ "^[[:space:]]*" tolower(key) "[[:space:]]*=" {
+      sub(/^[^=]*=/, "", line); n = split(line, p, ",")
+      for (i = 1; i <= n; i++) { gsub(/[[:space:]]/, "", p[i]); if (p[i] != "") print p[i] }
+    }' "$CONF"
+}
+ADDRS=$(vals Address); DNS=$(vals DNS | grep -E '^[0-9]+(\.[0-9]+){3}$' || true)
+MTU=$(vals MTU | head -n1); MTU=${MTU:-1420}
+[ -n "$ADDRS" ] || fail "no Address in config"
+[ -n "$DNS" ] || fail "no IPv4 DNS in config"
+
+# Keep only keys 'wg setconf' understands; PreUp/PostUp scripts are never run.
+awk '{ l = tolower($0) }
+     l ~ /^[[:space:]]*(address|dns|mtu|table|preup|postup|predown|postdown|saveconfig)[[:space:]]*=/ {next}
+     {print}' "$CONF" > "$work/wg.conf"
+
+def=$(ip -4 route show default | head -n1)
+GW=$(echo "$def" | awk '{for(i=1;i<NF;i++) if($i=="via") print $(i+1)}')
+DEV=$(echo "$def" | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}')
+[ -n "$GW" ] && [ -n "$DEV" ] || fail "no default route to start from"
+SUBNET=$(ip -4 route show dev "$DEV" scope link | awk '$1 ~ /\// {print $1; exit}')
+
+if ip link add "$WG" type wireguard 2>/dev/null; then
+  kind=kernel
+else
+  command -v wireguard-go >/dev/null 2>&1 || fail "kernel has no WireGuard and wireguard-go is not installed"
+  [ -c /dev/net/tun ] || { mkdir -p /dev/net; mknod /dev/net/tun c 10 200 2>/dev/null || true; }
+  [ -c /dev/net/tun ] || fail "kernel has no WireGuard and no /dev/net/tun for wireguard-go"
+  wireguard-go "$WG" || fail "wireguard-go failed to start"
+  kind=userspace
+fi
+wg setconf "$WG" "$work/wg.conf" || fail "wg setconf rejected the config"
+rm -f "$work/wg.conf"
+
+has6=0
+for a in $ADDRS; do
+  case "$a" in
+    *:*) ip -6 addr add "$a" dev "$WG" 2>/dev/null && has6=1 || log "IPv6 address $a not usable; IPv6 disabled" ;;
+    *)   ip -4 addr add "$a" dev "$WG" ;;
+  esac
+done
+ip link set mtu "$MTU" up dev "$WG"
+
+EP=$(wg show "$WG" endpoints | awk '{print $2}' | head -n1)
+EP_IP=${EP%:*}
+echo "$EP_IP" | grep -Eq '^[0-9]+(\.[0-9]+){3}$' || fail "endpoint '$EP' is not IPv4"
+
+# --- Kill switch: replace ALL routes. ---
+ip -4 route flush table main
+ip -4 route add "$EP_IP/32" via "$GW" dev "$DEV" onlink
+ip -4 route add default dev "$WG"
+ip -6 route flush table main 2>/dev/null || true
+if [ "$has6" = 1 ]; then
+  ip -6 route add default dev "$WG" 2>/dev/null || true
+else
+  { echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6; } 2>/dev/null || true
+fi
+
+# --- Viewer return path (TCP replies from the published port only). ---
+if [ -n "$PUB" ]; then
+  [ -n "$SUBNET" ] || fail "no local subnet found for the viewer return path"
+  ip -4 route add "$SUBNET" dev "$DEV" table 100
+  ip -4 rule add ipproto tcp sport "$PUB" lookup 100 priority 100 2>/dev/null ||
+    fail "kernel lacks port-based routing rules, so the viewer cannot work behind the kill switch"
+fi
+
+# DNS only to the VPN's resolver (reachable only through the tunnel).
+{ for d in $DNS; do echo "nameserver $d"; done; } > /etc/resolv.conf 2>/dev/null || true
+first=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null || true)
+echo "$DNS" | grep -Fqx "$first" || fail "could not point /etc/resolv.conf at the VPN DNS ($first)"
+
+i=0
+while [ "$i" -lt 30 ]; do
+  getent hosts example.com >/dev/null 2>&1 || true
+  hs=$(wg show "$WG" latest-handshakes | awk '{print $2}' | head -n1)
+  [ "${hs:-0}" -gt 0 ] 2>/dev/null && { log "tunnel up ($kind WireGuard, endpoint $EP_IP)"; exit 0; }
+  i=$((i+1)); sleep 0.5
+done
+fail "no WireGuard handshake within 15 seconds (wrong/expired config or server unreachable)"
+VPNUP
+
+  # --- Browser entrypoint (both modes) ---
+  cat > "$BUILD/secure-chromium" <<'CHROMIUM'
+#!/bin/sh
+set -eu
+umask 077
+PROFILE=/home/browser/.config/chromium
+DISPLAY_MODE="${SECURE_BROWSER_DISPLAY:-wayland}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/cocoa-way-runtime}"
+as_vnc() { setpriv --reuid=1300 --regid=1300 --init-groups --inh-caps=-all \
+  env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/run/vnc "$@"; }
+
+if [ "$(id -u)" = 0 ]; then
+  # ---- Root stage: tunnel, viewer services, profile; then drop privileges ----
+  chmod 1777 /tmp 2>/dev/null || true
+  if [ "${SECURE_BROWSER_VPN:-0}" = 1 ]; then
+    /usr/local/sbin/secure-browser-vpn-up || {
+      echo 'VPN could not start, so the browser was NOT launched (kill switch).' >&2; exit 1; }
+  fi
+
+  if [ "$DISPLAY_MODE" = vnc ]; then
+    [ -n "${VNC_PASSWORD:-}" ] || { echo 'No session password supplied.' >&2; exit 1; }
+    install -d -o 1300 -g 1300 -m 700 /run/vnc
+    mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+    printf '%s\n' "$VNC_PASSWORD" | tigervncpasswd -f > /run/vnc/passwd
+    chown 1300:1300 /run/vnc/passwd && chmod 600 /run/vnc/passwd
+    unset VNC_PASSWORD
+    if [ "${SECURE_BROWSER_VIEWER:-safari}" = safari ]; then
+      RFB_PORT=5901; LOCALONLY=1          # only websockify (same VM) talks to Xvnc
+    else
+      RFB_PORT=5901; LOCALONLY=0          # Screen Sharing connects straight to Xvnc
+    fi
+    # Clipboard sharing is OFF in both directions at the server.
+    as_vnc Xtigervnc :1 -geometry 1600x1000 -depth 24 -rfbport "$RFB_PORT" \
+      -localhost="$LOCALONLY" -SecurityTypes VncAuth -PasswordFile /run/vnc/passwd \
+      -AcceptCutText=0 -SendCutText=0 -SendPrimary=0 -SetPrimary=0 \
+      -nolisten tcp -ac -desktop 'Secure Chromium (research)' >/run/vnc/xvnc.log 2>&1 &
+    for _ in $(seq 1 100); do [ -S /tmp/.X11-unix/X1 ] && break; sleep 0.1; done
+    [ -S /tmp/.X11-unix/X1 ] || { cat /run/vnc/xvnc.log >&2; echo 'Xvnc did not start.' >&2; exit 1; }
+    if command -v matchbox-window-manager >/dev/null 2>&1; then
+      as_vnc env DISPLAY=:1 matchbox-window-manager -use_titlebar no >/dev/null 2>&1 &
+    fi
+    if [ "${SECURE_BROWSER_VIEWER:-safari}" = safari ]; then
+      as_vnc websockify --web /usr/share/novnc 6080 127.0.0.1:5901 >/run/vnc/websockify.log 2>&1 &
+      sleep 1
+    fi
+  fi
+
+  mkdir -p "$PROFILE" "$XDG_RUNTIME_DIR"
+  chown 1200:1200 /home/browser /home/browser/.config "$PROFILE"
+  chown -R 1200:1200 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+  if setpriv --bounding-set=-net_admin,-net_raw,-mknod true 2>/dev/null; then
+    set -- --bounding-set=-net_admin,-net_raw,-mknod
+  else
+    set --
+  fi
+  exec setpriv --reuid=1200 --regid=1200 --init-groups --inh-caps=-all "$@" \
+    env -u VNC_PASSWORD HOME=/home/browser USER=browser LOGNAME=browser /usr/local/bin/secure-chromium
+fi
+
+# ---- Unprivileged stage (uid 1200) ----
+if [ "${SECURE_BROWSER_VPN:-0}" = 1 ]; then
+  ip -4 route show default | grep -q 'dev wg0' || {
+    echo 'VPN required but traffic is not routed through wg0; refusing to start.' >&2; exit 1; }
+fi
+mkdir -p "$PROFILE"
+exec 9>"$PROFILE/.secure-browser-launch.lock"
+flock -n 9 || { echo 'Another Chromium already uses this profile.' >&2; exit 1; }
+
+if [ "${SECURE_BROWSER_PERSIST:-0}" = 1 ]; then
+  for d in "$PROFILE/Default" "$PROFILE"/Profile\ *; do
+    [ -d "$d" ] || continue
+    rm -f -- "$d/History" "$d/History-journal" "$d/Visited Links" \
+      "$d/Top Sites" "$d/Top Sites-journal" "$d/Shortcuts" "$d/Shortcuts-journal" \
+      "$d/Network/Cookies" "$d/Network/Cookies-journal" \
+      "$d/Favicons" "$d/Favicons-journal" "$d/Media History" "$d/Media History-journal"
+    rm -rf -- "$d/Sessions" "$d/Session Storage" "$d/Cache" "$d/Code Cache" \
+      "$d/GPUCache" "$d/Media Cache" "$d/Network/Cache"
+  done
+fi
+rm -f "$PROFILE/SingletonLock" "$PROFILE/SingletonSocket" "$PROFILE/SingletonCookie"
+
+if [ "$DISPLAY_MODE" = vnc ]; then
+  export DISPLAY=:1
+  exec dbus-run-session -- secure-browser-engine --ozone-platform=x11 --start-maximized \
+    --no-first-run --no-default-browser-check --user-data-dir="$PROFILE"
+fi
+
+if [ "${SECURE_BROWSER_AUDIO:-0}" = 1 ]; then
+  export PULSE_SERVER="unix:$XDG_RUNTIME_DIR/pulse/native"
+  for _ in $(seq 1 100); do [ -S "$XDG_RUNTIME_DIR/pulse/native" ] && break; sleep 0.05; done
+fi
+exec dbus-run-session -- secure-browser-engine --ozone-platform=wayland \
+  --no-first-run --no-default-browser-check --user-data-dir="$PROFILE"
+CHROMIUM
+
+  # --- Self-test helper (short-lived container, never launches Chromium) ---
+  cat > "$BUILD/secure-browser-vpn-selftest" <<'SELFTEST'
+#!/bin/sh
+set -u
+GW=$(ip -4 route show default | awk '{for(i=1;i<NF;i++) if($i=="via") print $(i+1); exit}')
+/usr/local/sbin/secure-browser-vpn-up 2>&1 | sed 's/^/  /' || { echo "RESULT vpn_up FAIL"; exit 1; }
+echo "RESULT vpn_up PASS"
+as_browser() { setpriv --reuid=1200 --regid=1200 --init-groups "$@"; }
+ip=$(as_browser curl -fsS --max-time 15 https://api.ipify.org 2>/dev/null || true)
+echo "RESULT exit_ip ${ip:-NONE}"
+if as_browser test -r /root/secure-browser-vpn/wireguard.conf 2>/dev/null; then
+  echo "RESULT key_hidden FAIL"; else echo "RESULT key_hidden PASS"; fi
+ok=PASS
+for t in 192.168.1.1 10.0.0.1 172.16.0.1 ${GW:-}; do
+  ip route get "$t" 2>/dev/null | grep -q 'dev wg0' || ok=FAIL
+done
+echo "RESULT lan_and_mac_routed_into_tunnel $ok"
+if [ -n "${SECURE_BROWSER_PUBLISHED_PORT:-}" ]; then
+  ip rule show | grep -q "sport ${SECURE_BROWSER_PUBLISHED_PORT} lookup 100" &&
+  ip route get "${GW:-0.0.0.0}" ipproto tcp sport "${SECURE_BROWSER_PUBLISHED_PORT}" 2>/dev/null | grep -qv 'dev wg0' &&
+  ip route get "${GW:-0.0.0.0}" ipproto tcp sport 40000 2>/dev/null | grep -q 'dev wg0' &&
+  ip route get "${GW:-0.0.0.0}" ipproto udp sport "${SECURE_BROWSER_PUBLISHED_PORT}" 2>/dev/null | grep -q 'dev wg0' &&
+  echo "RESULT viewer_return_path_only PASS" || echo "RESULT viewer_return_path_only FAIL"
+fi
+ip link set wg0 down
+if as_browser curl -fsS --max-time 8 https://api.ipify.org >/dev/null 2>&1; then
+  echo "RESULT kill_switch FAIL"; else echo "RESULT kill_switch PASS"; fi
+SELFTEST
+
+  chmod 755 "$BUILD/secure-chromium" "$BUILD/secure-browser-vpn-up" "$BUILD/secure-browser-vpn-selftest"
+
+  local audio_pkgs='' audio_copy=''
+  if audio_on; then
+    audio_pkgs='pipewire pipewire-pulse wireplumber pulseaudio-utils perl'
+    audio_copy=$'COPY cocoa-way-audio-relay /usr/local/bin/cocoa-way-audio-relay\nRUN chmod 755 /usr/local/bin/cocoa-way-audio-relay'
+  fi
+  local browser_layer
+  if [[ "$BROWSER" == chrome ]]; then
+    # Google's official ARM64 Chrome. The signing key is checked against Google's
+    # published fingerprint before apt trusts it; Chrome's installer is told not
+    # to rewrite the repository config (repo_add_once=false), so apt stays valid
+    # for the automatic update checks.
+    browser_layer='# Browser: Google Chrome (official) from Google'"'"'s signed apt repository.
+RUN apt-get update && apt-get install -y --no-install-recommends gnupg && \
+    curl -fsSL https://dl.google.com/linux/linux_signing_key.pub -o /tmp/google.pub && \
+    gpg --show-keys --with-colons /tmp/google.pub | grep "^fpr" | grep -q "EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796" && \
+    gpg --dearmor < /tmp/google.pub > /usr/share/keyrings/google-chrome.gpg && rm -f /tmp/google.pub && \
+    printf "repo_add_once=\"false\"\nrepo_reenable_on_distupgrade=\"false\"\n" > /etc/default/google-chrome && \
+    echo "deb [arch=arm64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+      > /etc/apt/sources.list.d/google-chrome.list && \
+    apt-get update && apt-get install -y --no-install-recommends google-chrome-stable && \
+    find /etc/apt/sources.list.d -name "google-chrome*" ! -name google-chrome.list -delete && \
+    apt-get purge -y gnupg && apt-get autoremove -y && apt-get update -qq && \
+    test -u /opt/google/chrome/chrome-sandbox && \
+    ln -s /usr/bin/google-chrome-stable /usr/local/bin/secure-browser-engine && \
+    rm -rf /var/lib/apt/lists/*'
+  else
+    browser_layer='# Browser: Debian Chromium.
+RUN apt-get update && apt-get install -y --no-install-recommends chromium chromium-sandbox && \
+    test -f /usr/lib/chromium/chrome-sandbox && chmod 4755 /usr/lib/chromium/chrome-sandbox && \
+    ln -s /usr/bin/chromium /usr/local/bin/secure-browser-engine && \
+    rm -rf /var/lib/apt/lists/*'
+  fi
+  cat > "$BUILD/Dockerfile" <<DOCKERFILE
+FROM debian:trixie-slim
+
+RUN apt-get update && \\
+    apt-get install -y --no-install-recommends \\
+      ca-certificates dbus-x11 util-linux \\
+      wireguard-tools iproute2 curl fonts-liberation fonts-noto-color-emoji \\
+      waypipe \\
+      tigervnc-standalone-server tigervnc-tools novnc websockify \\
+      xfonts-base x11-xkb-utils xkb-data \\
+      $audio_pkgs && \\
+    command -v setpriv && command -v flock && command -v wg && \\
+    command -v Xtigervnc && command -v tigervncpasswd && command -v websockify && \\
+    test -f /usr/share/novnc/vnc.html && \\
+    rm -rf /var/lib/apt/lists/*
+
+$browser_layer
+
+# Optional extras: userspace WireGuard fallback (if the VM kernel lacks the
+# module) and a window manager that keeps the browser filling the viewer.
+RUN apt-get update && \\
+    (apt-get install -y --no-install-recommends wireguard-go || echo 'wireguard-go not available') && \\
+    (apt-get install -y --no-install-recommends matchbox-window-manager || echo 'matchbox not available') && \\
+    rm -rf /var/lib/apt/lists/* && mkdir -p /var/lib/xkb
+
+# 1200 = browser (untrusted content). 1300 = viewer services (Xvnc, noVNC).
+RUN useradd --create-home --uid 1200 --shell /usr/sbin/nologin browser && \\
+    useradd --no-create-home --home-dir /run/vnc --uid 1300 --shell /usr/sbin/nologin vncview && \\
+    mkdir -p /etc/chromium/policies/managed /etc/opt/chrome/policies/managed /root/secure-browser-vpn && \\
+    chmod 700 /root
+
+COPY secure-browser-policy.json /etc/chromium/policies/managed/secure-browser.json
+COPY secure-browser-policy.json /etc/opt/chrome/policies/managed/secure-browser.json
+COPY secure-chromium /usr/local/bin/secure-chromium
+COPY secure-browser-vpn-up /usr/local/sbin/secure-browser-vpn-up
+COPY secure-browser-vpn-selftest /usr/local/sbin/secure-browser-vpn-selftest
+$audio_copy
+RUN chmod 755 /usr/local/bin/secure-chromium /usr/local/sbin/secure-browser-vpn-up \\
+      /usr/local/sbin/secure-browser-vpn-selftest && \\
+    chmod 644 /etc/chromium/policies/managed/secure-browser.json /etc/opt/chrome/policies/managed/secure-browser.json
+
+USER browser
+ENV HOME=/home/browser
+WORKDIR /home/browser
+DOCKERFILE
+}
+
+context_hash() {
+  local files=(Dockerfile secure-browser-policy.json secure-chromium secure-browser-vpn-up secure-browser-vpn-selftest)
+  audio_on && files+=(cocoa-way-audio-relay)
+  (cd "$BUILD" && /usr/bin/shasum -a 256 "${files[@]}" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')
+}
+
+# ---------------------------------------------------------------------------
+# Automatic image updates
+# ---------------------------------------------------------------------------
+debian_updates_pending() {   # prints count, or fails if the check could not run
+  container run --rm --user 0 "$IMAGE" /bin/sh -c \
+    'apt-get update -qq >/dev/null 2>&1 || exit 2; apt list --upgradable 2>/dev/null | grep -c "upgradable from" || true'
+}
+
+ensure_image_current() {
+  local force="$1" reason='' hash previous=''
+  hash="$(context_hash)"
+  [[ -r "$STATE/build.sha256" ]] && previous="$(<"$STATE/build.sha256")"
+
+  if (( force )); then reason='update requested'
+  elif ! container image inspect "$IMAGE" >/dev/null 2>&1; then reason='no image yet'
+  elif [[ "$previous" != "$hash" ]]; then reason='settings changed'
+  elif ! stamp_fresh image-built $(( MAX_IMAGE_AGE_DAYS * 24 )); then reason="image older than $MAX_IMAGE_AGE_DAYS days"
+  elif ! stamp_fresh image-checked "$UPDATE_CHECK_HOURS"; then
+    info 'Checking Debian for Chromium and system security updates...'
+    local n
+    if n="$(debian_updates_pending 2>/dev/null)" && [[ "$n" == <-> ]]; then
+      stamp image-checked
+      (( n > 0 )) && reason="$n Debian package update(s) available (including Chromium if listed)"
+    else
+      warn 'Could not check Debian for updates (offline?). Using the existing image.'
+    fi
+  fi
+
+  [[ -z "$reason" ]] && return 0
+  info "Rebuilding the browser image: $reason. This takes a few minutes..."
+  local cache=(--no-cache)
+  [[ "$reason" == 'settings changed' ]] && cache=()
+  if ! container build --pull "${cache[@]}" -t "$IMAGE" "$BUILD"; then
+    if [[ "$BROWSER" == chrome ]]; then
+      warn "Couldn't install Google Chrome (Google's repository unreachable or no ARM64 package)."
+      confirm "Build with Debian's Chromium instead this time?" || die 'Image build failed; not launching.'
+      BROWSER=chromium
+      write_build_context; hash="$(context_hash)"
+      container build --pull --no-cache -t "$IMAGE" "$BUILD" || die 'Image build failed; not launching.'
+    else
+      die 'Image build failed; not launching with a possibly unpatched browser.'
+    fi
+  fi
+  print -r -- "$hash" > "$STATE/build.sha256"
+  stamp image-built; stamp image-checked
+  info "Image ready: $(container run --rm "$IMAGE" secure-browser-engine --version 2>/dev/null || print "$BROWSER")"
+}
+
+ensure_profile_volume() {
+  container volume inspect "$PROFILE_VOLUME" >/dev/null 2>&1 && return 0
+  info 'Creating persistent browser profile volume...'
+  container volume create "$PROFILE_VOLUME" >/dev/null
+  container run --rm --user 0 \
+    --mount "type=volume,source=$PROFILE_VOLUME,target=/profile" \
+    "$IMAGE" /bin/sh -c 'chown -R 1200:1200 /profile'
+}
+
+vpn_args() {   # common container args for the VPN (prints one per line)
+  (( VPN_ON )) || return 0
+  print -l -- --cap-add NET_ADMIN --cap-add MKNOD \
+    --mount "type=bind,source=$VPN_DIR,target=/root/secure-browser-vpn,readonly" \
+    --dns "$VPN_DNS" -e SECURE_BROWSER_VPN=1
+}
+
+# ---------------------------------------------------------------------------
+# RESEARCH_MODE=1: pixel streaming
+# ---------------------------------------------------------------------------
+research_running() { container list --quiet 2>/dev/null | /usr/bin/grep -qx "$RESEARCH_NAME"; }
+
+open_viewer() {   # open_viewer PORT PASSWORD [VIEWER]
+  local port="$1" pw="$2" viewer="${3:-$VIEWER}"
+  if [[ "$viewer" == safari ]]; then
+    # Password goes in the URL fragment, which noVNC reads locally and never sends to the server.
+    /usr/bin/open -a Safari \
+      "http://127.0.0.1:$port/vnc.html#autoconnect=1&reconnect=1&resize=remote&path=websockify&password=$pw"
+    info "Viewer: Safari at http://127.0.0.1:$port/vnc.html (password: $pw)"
+  else
+    /usr/bin/open "vnc://:$pw@127.0.0.1:$port"
+    info "Viewer: Screen Sharing at vnc://127.0.0.1:$port (password: $pw)"
+    info '  IMPORTANT: in Screen Sharing, turn OFF Edit > Use Shared Clipboard.'
+  fi
+}
+
+launch_research() {
+  local port pw args=() i
+  port="$(view_port)"
+  if research_running; then
+    if running_is_current research && [[ -r "$STATE/session.pw" ]]; then
+      info 'Research browser already running and up to date; reopening the viewer.'
+      reopen_running_viewer
+      return 0
+    fi
+    info 'The running research browser was started with an older image or settings.'
+    if confirm 'Restart it now with the updated version? (closes its tabs)'; then
+      container stop "$RESEARCH_NAME" >/dev/null 2>&1 || true
+      for i in {1..40}; do
+        container inspect "$RESEARCH_NAME" >/dev/null 2>&1 || break   # --rm removes it
+        sleep 0.5
+      done
+      container inspect "$RESEARCH_NAME" >/dev/null 2>&1 && die "Old research container still exists; run: container delete $RESEARCH_NAME"
+    else
+      [[ -r "$STATE/session.pw" ]] || die "Its viewer password is missing; run $SELF --stop and relaunch."
+      warn 'Keeping the old session; reopening its viewer. Updates apply the next time it starts.'
+      reopen_running_viewer
+      return 0
+    fi
+  fi
+  # A stopped container with our name (e.g. after a crash) would block the new one.
+  if container inspect "$RESEARCH_NAME" >/dev/null 2>&1; then
+    container delete "$RESEARCH_NAME" >/dev/null 2>&1 || die "Remove the old container first: container delete $RESEARCH_NAME"
+  fi
+  /usr/sbin/lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 &&
+    die "Port $port on this Mac is already in use; free it or change VIEW_PORT_* in the script."
+
+  pw="$(/usr/bin/openssl rand -base64 24 | /usr/bin/tr -dc 'A-Za-z0-9' | /usr/bin/cut -c1-8)"
+  [[ ${#pw} -eq 8 ]] || die 'Could not generate a session password.'
+  mkdir -p "$STATE"; print -r -- "$pw" > "$STATE/session.pw"; chmod 600 "$STATE/session.pw"
+
+  local cport=6080
+  [[ "$VIEWER" == screensharing ]] && cport=5901
+  args=(run -d --rm --init --name "$RESEARCH_NAME" --user 0
+        --memory 4G --cpus 4 --shm-size 1G
+        -p "127.0.0.1:$port:$cport"
+        --read-only --tmpfs /tmp --tmpfs /run --tmpfs /var/tmp --tmpfs /var/lib/xkb --tmpfs /home/browser
+        -e SECURE_BROWSER_DISPLAY=vnc -e "SECURE_BROWSER_VIEWER=$VIEWER"
+        -e "SECURE_BROWSER_PUBLISHED_PORT=$cport" -e "VNC_PASSWORD=$pw"
+        ${(f)"$(vpn_args)"})
+  args+=("$IMAGE" /usr/local/bin/secure-chromium)
+
+  info 'Starting the research browser VM...'
+  if [[ ! -e "$STATE/local-network-explained" ]]; then
+    info '  macOS may ask: Allow "container-runtime-linux" to find devices on local networks?'
+    info '  Choose ALLOW. It is Apple Container relaying the viewer from 127.0.0.1 into the VM.'
+    info '  Your home network stays blocked by the kill switch inside the VM either way.'
+    : > "$STATE/local-network-explained"
+  fi
+  container "${args[@]}" >/dev/null || die 'Apple Container refused to start the research browser.'
+  local reachable=0
+  for i in {1..120}; do
+    research_running || break
+    if [[ "$VIEWER" == safari ]]; then
+      /usr/bin/curl -fsS --max-time 2 -o /dev/null "http://127.0.0.1:$port/vnc.html" 2>/dev/null && { reachable=1; break; }
+    else
+      /usr/bin/nc -z 127.0.0.1 "$port" 2>/dev/null && { reachable=1; break; }
+    fi
+    sleep 0.5
+  done
+  if research_running && (( ! reachable )); then
+    warn "The browser VM is running but the viewer at 127.0.0.1:$port isn't answering."
+    info '  If you chose "Don'"'"'t Allow" on the local-network prompt, turn it on in System Settings >'
+    info '  Privacy & Security > Local Network (container-runtime-linux), then run this again.'
+  fi
+  if ! research_running; then
+    container logs "$RESEARCH_NAME" 2>/dev/null | /usr/bin/tail -n 40 || true
+    (( VPN_ON )) && info 'If the log mentions secure-browser-vpn, the tunnel failed and the kill switch kept the browser offline.'
+    die 'The research browser stopped during startup.'
+  fi
+  sleep 1
+  session_fingerprint > "$STATE/running-research"
+  print -r -- "$VIEWER $port" > "$STATE/running-viewer"
+  open_viewer "$port" "$pw"
+}
+
+reopen_running_viewer() {   # use the viewer and port the running session was started with
+  local v p
+  read -r v p < "$STATE/running-viewer" 2>/dev/null || { v="$VIEWER"; p="$(view_port)"; }
+  open_viewer "$p" "$(<"$STATE/session.pw")" "$v"
+}
+
+# ---------------------------------------------------------------------------
+# RESEARCH_MODE=0: Cocoa-Way native window
+# ---------------------------------------------------------------------------
+session_running() {
+  local json
+  command -v cocoa-wayctl >/dev/null 2>&1 || return 1
+  cocoa-wayctl --json status >/dev/null 2>&1 || return 1
+  json="$(cocoa-wayctl --json applications 2>/dev/null || true)"
+  print -r -- "$json" | /usr/bin/grep -q "\"name\":\"$SESSION\".*\"state\":\"Running\""
+}
+
+stop_all() {
+  if research_running; then
+    info 'Stopping the research browser...'
+    container stop "$RESEARCH_NAME" >/dev/null 2>&1 || true
+  fi
+  rm -f "$STATE/session.pw" "$STATE/running-research" "$STATE/running-viewer"
+  session_running || return 0
+  info "Stopping $SESSION..."
+  cocoa-wayctl stop "$SESSION" >/dev/null 2>&1 || true
+  local i
+  for i in {1..60}; do session_running || { rm -f "$STATE/running-cocoa"; return 0; }; sleep 0.25; done
+  die "$SESSION did not stop; close it manually and retry."
+}
+
+cocoa_config_without_session() {   # prints Cocoa-Way config minus our session entry
+  [[ -r "$CW_CONFIG" ]] || return 0
+  /usr/bin/awk -v want="\"$SESSION\"" '
+    function emit() { if (!in_s || !target) printf "%s", block }
+    /^[[:space:]]*\[\[session\]\][[:space:]]*$/ { emit(); block=$0 ORS; in_s=1; target=0; next }
+    { if (in_s && $0 ~ /^[[:space:]]*name[[:space:]]*=/ && index($0, want)) target=1; block=block $0 ORS }
+    END { emit() }' "$CW_CONFIG" |
+  /usr/bin/awk 'NF { if (seen) printf "%s", blanks; print; seen=1; blanks=""; next } { if (seen) blanks=blanks $0 ORS }'
+}
+
+# Research mode: the old Cocoa-Way browser must not keep running unnoticed, and
+# its app-list entry must not be able to start the new image without the VPN.
+retire_cocoa_session() {
+  if session_running; then
+    info ''
+    info "The older '$SESSION' browser (Cocoa-Way window) is still running."
+    info '  It does NOT have research-mode protections (and may have no VPN).'
+    if confirm 'Stop it now? (recommended)'; then
+      cocoa-wayctl stop "$SESSION" >/dev/null 2>&1 || true
+      local i; for i in {1..60}; do session_running || break; sleep 0.25; done
+      session_running && warn "Could not stop '$SESSION'; close its windows yourself."
+    else
+      warn "Leaving '$SESSION' running. Do not use that window for untrusted sites."
+    fi
+  fi
+  if [[ -r "$CW_CONFIG" ]] && /usr/bin/grep -Fq "name = \"$SESSION\"" "$CW_CONFIG"; then
+    local work; work="$(mktemp "${TMPDIR:-/tmp}/secure-browser-cocoa.XXXXXX")"
+    cocoa_config_without_session > "$work"
+    /bin/cp -f "$CW_CONFIG" "$STATE/container-sessions.toml.bak"
+    chmod 600 "$work"; mv -f "$work" "$CW_CONFIG"
+    info "Removed the old '$SESSION' entry from Cocoa-Way's app list so it can't start the new image"
+    info "  without the VPN setup (backup: $STATE/container-sessions.toml.bak). RESEARCH_MODE=0 recreates it."
+  fi
+}
+
+# What a running session was started with; a mismatch means it is out of date.
+session_fingerprint() {
+  local h='' b=''
+  [[ -r "$STATE/build.sha256" ]] && h="$(<"$STATE/build.sha256")"
+  [[ -r "$STATE/image-built" ]] && b="$(<"$STATE/image-built")"
+  print -r -- "$h|$b|vpn=$VPN_ON|viewer=$VIEWER|persist=$(profile_persistent && print 1 || print 0)|dl=$ENABLE_DOWNLOADS|audio=$(audio_on && print 1 || print 0)"
+}
+running_is_current() {   # running_is_current research|cocoa
+  [[ -r "$STATE/running-$1" && "$(<"$STATE/running-$1")" == "$(session_fingerprint)" ]]
+}
+
+CONFIG_CHANGED=0
+write_cocoa_config() {
+  local work rargs=() a joined=''
+  mkdir -p "${CW_CONFIG:h}"
+  work="$(mktemp "${TMPDIR:-/tmp}/secure-browser-cocoa.XXXXXX")"
+  rargs=(--user 0 --memory 4G --cpus 4 --shm-size 1G)
+  if profile_persistent; then
+    rargs+=(--mount "type=volume,source=$PROFILE_VOLUME,target=/home/browser/.config/chromium"
+            -e SECURE_BROWSER_PERSIST=1)
+  else
+    rargs+=(--tmpfs /home/browser/.config/chromium)
+  fi
+  (( ENABLE_DOWNLOADS )) && rargs+=(--mount "type=bind,source=$DOWNLOADS,target=/home/browser/Downloads")
+  rargs+=(${(f)"$(vpn_args)"})
+  audio_on && rargs+=(-e SECURE_BROWSER_AUDIO=1)
+  for a in "${rargs[@]}"; do joined+="\"$a\", "; done
+  joined="${joined%, }"
+
+  cocoa_config_without_session > "$work"
+  [[ -s "$work" ]] && print >> "$work"
+  cat >> "$work" <<EOF_CONFIG
+[[session]]
+name = "$SESSION"
+runtime = "container"
+image = "$IMAGE"
+profile = "single-app"
+presentation = "rootless"
+display = "auto"
+audio = $( audio_on && print true || print false )
+command = "/usr/local/bin/secure-chromium"
+runtime_args = [$joined]
+EOF_CONFIG
+  if [[ -r "$CW_CONFIG" ]] && /usr/bin/cmp -s "$work" "$CW_CONFIG"; then
+    rm -f "$work"; CONFIG_CHANGED=0
+  else
+    chmod 600 "$work"; mv -f "$work" "$CW_CONFIG"; CONFIG_CHANGED=1
+  fi
+}
+
+start_cocoa_way() {
+  if cocoa-wayctl --json status >/dev/null 2>&1; then
+    (( CONFIG_CHANGED )) || return 0
+    info 'Cocoa-Way must restart to load the new settings (this closes other Cocoa-Way apps).'
+    confirm 'Restart Cocoa-Way now?' || die 'Settings saved; restart Cocoa-Way yourself and rerun.'
+    /usr/bin/killall cocoa-way 2>/dev/null || true
+    sleep 1
+  fi
+  info 'Starting Cocoa-Way...'
+  cocoa-way >"$CW_LOG" 2>&1 &!
+  local i
+  for i in {1..80}; do cocoa-wayctl --json status >/dev/null 2>&1 && return 0; sleep 0.25; done
+  cat "$CW_LOG" >&2 || true
+  die 'Cocoa-Way did not start.'
+}
+
+launch_cocoa() {
+  if session_running; then
+    if running_is_current cocoa; then
+      info "$SESSION is already running and up to date. Use Command-N for a new window."
+      return 0
+    fi
+    info "The running '$SESSION' was started with an older image or settings."
+    if confirm 'Restart it now with the updated version? (closes its windows)'; then
+      cocoa-wayctl stop "$SESSION" >/dev/null 2>&1 || true
+      local j; for j in {1..60}; do session_running || break; sleep 0.25; done
+      session_running && die "Could not stop '$SESSION'; close it and rerun."
+    else
+      warn 'Keeping the old session. Updates apply the next time it starts.'
+      return 0
+    fi
+  fi
+  profile_persistent && ensure_profile_volume
+  write_cocoa_config
+  start_cocoa_way
+  info 'Launching Secure Chromium...'
+  cocoa-wayctl launch "$SESSION" || die 'Launch request failed.'
+  local i ok=0
+  for i in {1..80}; do session_running && { ok=1; break; }; sleep 0.25; done
+  if (( ! ok )); then
+    cocoa-wayctl --json logs "$SESSION" 2>/dev/null || true
+    die 'Secure Chromium did not stay running.'
+  fi
+  session_fingerprint > "$STATE/running-cocoa"
+}
+
+# ---------------------------------------------------------------------------
+# --test
+# ---------------------------------------------------------------------------
+self_test() {
+  local fails=0
+  container system status >/dev/null 2>&1 || die 'Apple Container is not running; launch the browser once first.'
+  container image inspect "$IMAGE" >/dev/null 2>&1 || die 'Image missing; launch the browser once first.'
+
+  info 'Test 1: image contents.'
+  if container run --rm "$IMAGE" /bin/sh -ec '
+      test "$(id -u)" = 1200
+      command -v secure-browser-engine >/dev/null && command -v setpriv >/dev/null && command -v wg >/dev/null
+      command -v Xtigervnc >/dev/null && command -v websockify >/dev/null
+      test -f /usr/share/novnc/vnc.html
+      test -u /opt/google/chrome/chrome-sandbox || test -u /usr/lib/chromium/chrome-sandbox
+      test -r /etc/opt/chrome/policies/managed/secure-browser.json
+      test -r /etc/chromium/policies/managed/secure-browser.json
+      secure-browser-engine --version'; then info '  PASS'; else info '  FAIL'; fails=$((fails+1)); fi
+
+  info 'Test 2: image policy matches these settings (JIT, clipboard, downloads).'
+  local g h
+  g="$(container run --rm "$IMAGE" sha256sum /etc/opt/chrome/policies/managed/secure-browser.json 2>/dev/null | /usr/bin/awk '{print $1}' || true)"
+  h="$(/usr/bin/shasum -a 256 "$BUILD/secure-browser-policy.json" 2>/dev/null | /usr/bin/awk '{print $1}' || true)"
+  if [[ -n "$h" && "$g" == "$h" ]]; then info '  PASS'; else info '  FAIL (run the launcher to rebuild)'; fails=$((fails+1)); fi
+
+  prepare_vpn
+  if (( VPN_ON )); then
+    info 'Test 3: tunnel, exit IP, hidden key, LAN/Mac blocked, viewer return path, kill switch.'
+    local out host_ip exit_ip r pubenv=()
+    (( RESEARCH_MODE )) && pubenv=(-e "SECURE_BROWSER_PUBLISHED_PORT=$([[ $VIEWER == safari ]] && print 6080 || print 5901)")
+    out="$(container run --rm --user 0 ${(f)"$(vpn_args)"} "${pubenv[@]}" \
+            "$IMAGE" /usr/local/sbin/secure-browser-vpn-selftest 2>&1 || true)"
+    print -r -- "$out" | /usr/bin/grep -v '^RESULT' || true
+    host_ip="$(/usr/bin/curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    exit_ip="$(print -r -- "$out" | /usr/bin/awk '$2=="exit_ip"{print $3}')"
+    local checks=(vpn_up key_hidden lan_and_mac_routed_into_tunnel kill_switch)
+    (( RESEARCH_MODE )) && checks+=(viewer_return_path_only)
+    for r in "${checks[@]}"; do
+      if print -r -- "$out" | /usr/bin/grep -q "^RESULT $r PASS"; then info "  PASS $r"
+      else info "  FAIL $r"; fails=$((fails+1)); fi
+    done
+    if [[ -n "$exit_ip" && "$exit_ip" != NONE && "$exit_ip" != "$host_ip" ]]; then
+      info "  PASS exit IP $exit_ip differs from this Mac's IP ${host_ip:-unknown}"
+    else
+      info "  FAIL exit IP '${exit_ip:-none}' (Mac: ${host_ip:-unknown})"; fails=$((fails+1))
+    fi
+  else
+    info 'Test 3: VPN off; tunnel tests skipped.'
+  fi
+
+  if (( RESEARCH_MODE )); then
+    info "Test 4: viewer port is bound to this Mac only (127.0.0.1)."
+    if research_running; then
+      local p; p="$(view_port)"
+      if /usr/sbin/lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null | /usr/bin/awk 'NR>1{print $9}' | /usr/bin/grep -vq '^127\.0\.0\.1:'; then
+        info '  FAIL viewer port is reachable from other machines'; fails=$((fails+1))
+      else info '  PASS'; fi
+    else
+      info '  SKIPPED (start the research browser first)'
+    fi
+  fi
+
+  info 'Manual checks in the research browser: chrome://policy (no errors), chrome://sandbox (green),'
+  info '  a DNS/WebRTC leak test page, and copy/paste between Mac and browser should NOT work.'
+  (( fails == 0 )) || die "$fails test(s) failed."
+  info 'All automated tests passed.'
+}
+
+# ---------------------------------------------------------------------------
+main() {
+  case "$MODE" in
+    check)
+      local t missing=0 tools=(container)
+      (( RESEARCH_MODE )) || tools+=(cocoa-way cocoa-wayctl waypipe)
+      for t in "${tools[@]}"; do
+        if command -v "$t" >/dev/null 2>&1; then info "OK: $t"; else info "MISSING: $t"; missing=1; fi
+      done
+      [[ -r "$WIREGUARD_CONF" ]] && info "OK: WireGuard config $WIREGUARD_CONF" ||
+        info "NO WireGuard config at $WIREGUARD_CONF (needed for VPN=1)"
+      return $missing ;;
+    stop) stop_all; return 0 ;;
+    test) self_test; return 0 ;;
+    import) import_vpn; return 0 ;;
+    reset)
+      stop_all
+      container volume inspect "$PROFILE_VOLUME" >/dev/null 2>&1 || { info 'No persistent profile to delete.'; return 0; }
+      info "This deletes the persistent profile volume '$PROFILE_VOLUME' (extensions, logins, settings)."
+      confirm 'Delete it?' || return 0
+      container volume delete "$PROFILE_VOLUME"
+      info 'Persistent profile deleted.'; return 0 ;;
+  esac
+
+  ensure_host_prerequisites
+  [[ ! -L "$BASE" && ! -L "$BUILD" && ! -L "$DOWNLOADS" && ! -L "$CW_CONFIG" ]] || die 'Refusing symlinked paths.'
+  case "$HOME" in *'"'*|*'\'*|*','*|*$'\n'*) die 'Your home folder path has characters this script cannot pass safely.' ;; esac
+  mkdir -p "$BASE" "$STATE"; chmod 700 "$BASE" "$STATE"
+  if (( ENABLE_DOWNLOADS )) && [[ ! -d "$DOWNLOADS" ]]; then mkdir -p "$DOWNLOADS"; chmod 700 "$DOWNLOADS"; fi
+
+  local force=0
+  [[ "$MODE" == update ]] && { force=1; stop_all; }
+
+  container system status >/dev/null 2>&1 || {
+    info 'Starting Apple Container...'
+    container system start || die 'Apple Container did not start (try: container system kernel set --recommended).'
+  }
+  run_security_checks "$force"
+
+  prepare_vpn
+  if (( VPN_ON && INSTALL_PROTON_EXTENSION )); then
+    info 'Note: WireGuard is on, so the Proton extension is not needed. Set INSTALL_PROTON_EXTENSION=0'
+    info '  to use a throwaway profile with no stored login.'
+  fi
+  write_build_context
+  ensure_image_current "$force"   # rebuilds now if needed; a running session keeps its old copy
+
+  if (( RESEARCH_MODE )); then
+    retire_cocoa_session
+    launch_research
+  else
+    launch_cocoa
+  fi
+
+  local vpn_line
+  if (( VPN_ON )); then vpn_line='VPN on, with kill switch (no internet if the VPN drops; home network blocked)'
+  elif (( VPN )); then vpn_line='VPN OFF for this session (no config found), so sites see your real IP'
+  else vpn_line='VPN off (VPN=0 in settings), so sites see your real IP'; fi
+
+  info ''
+  if (( RESEARCH_MODE )); then
+    info "Your research browser is open in ${${VIEWER:#safari}:+Screen Sharing}${${VIEWER:#screensharing}:+Safari}."
+    info ''
+    info "  Network:     $vpn_line"
+    info '  Isolation:   no copy/paste and no downloads between the browser and your Mac'
+    info '  Fresh start: nothing is kept; each session starts clean'
+    info '  Hardening:   extra exploit protection (JavaScript JIT turned off)'
+    info ''
+    info '  Shortcuts:   use Ctrl instead of Command (Ctrl-T new tab, Ctrl-L address bar)'
+    info "  To finish:   close the browser window, or run  $SELF --stop"
+  else
+    info 'Your browser is open in its own window (convenience mode).'
+    info ''
+    info "  Network:     $vpn_line"
+    info '  Clipboard:   copy/paste with your Mac is ON. Don'"'"'t copy passwords while it runs.'
+    info "  To finish:   close the browser, or run  $SELF --stop"
+  fi
+  info ''
+  info "  Check setup: $SELF --test        Update now: $SELF --update"
+}
+
+main
