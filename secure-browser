@@ -190,9 +190,12 @@ is_admin() { /usr/bin/id -Gn | /usr/bin/grep -qw admin; }
 admin_needed_for_container() {   # admin_needed_for_container WHY
   warn "$1"
   info "This account is not an administrator, so it can't install or update Apple Container"
-  info '(the installer is system-wide and needs sudo). Ask an admin account to do it, then rerun here:'
-  info '  - install the newest signed .pkg from https://github.com/apple/container/releases, or'
-  info '  - run:  sudo /usr/local/bin/update-container.sh'
+  info '(the installer is system-wide and needs sudo). To update it:'
+  info '  1. In THIS account, stop its Apple Container service:   container system stop'
+  info '  2. In an ADMIN account, update it with either:'
+  info '       - the newest signed .pkg from https://github.com/apple/container/releases, or'
+  info '       - Apple'"'"'s own updater (installed with it):   sudo /usr/local/bin/update-container.sh'
+  info '  3. Back in THIS account, check   container --version   then rerun this script.'
 }
 
 ensure_host_prerequisites() {
