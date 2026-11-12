@@ -60,13 +60,40 @@ Then check everything once:
 
 ## Extra isolation: run it from a separate Mac account
 
-For an additional barrier, install and run `secure-browser` in a **dedicated macOS user account**, separate from the one you use day to day (create one in System Settings > Users & Groups, and switch to it with Fast User Switching). Then the account, the Apple Container VM and the browser inside it are three nested layers. Even if a hostile page escaped the browser and the VM, it would land in an account with none of your files, keychain, browser profiles or logins, and macOS file permissions keep it away from your main account.
+For an additional barrier, install and run `secure-browser` in a **dedicated macOS user account**, separate from the one you use day to day. Then the account, the Apple Container VM and the browser inside it are three nested layers. Even if a hostile page escaped the browser and the VM, it would land in an account with none of your files, keychain, browser profiles or logins, and macOS file permissions keep it away from your main account.
 
-- Do the install steps above while logged in as the dedicated account. Its images, volumes, VPN config and session state live in that account's home folder.
-- Apple Container's installer is system-wide and asks for an admin password. If the dedicated account isn't an admin, install or update Apple Container once from an admin account; the launcher will then find it.
-- Viewing needs a desktop session: be logged in on screen as that account (Fast User Switching or Screen Sharing). If you start it over SSH, or the launcher can't open Safari, it prints a ready-to-use login link and the password instead of stopping. Paste the link into Safari on that account's desktop, or run `~/secure-browser --open` from a Terminal there.
-- The viewer listens on `127.0.0.1` of the Mac, so other accounts on the same Mac can reach the port, but they still need the per-session password.
-- This is an extra layer, not a guarantee. Local privilege-escalation bugs in macOS exist, so keep macOS updated. Not yet tested on real Macs; see the limits below.
+**Recommended setup: a standard user you reach over SSH, with no sudo.**
+
+1. Create the user in System Settings > Users & Groups as a **Standard** user, not an Administrator, so it has no `sudo` access. Don't sign in to iCloud or your real accounts there.
+2. Turn on **Remote Login** (System Settings > General > Sharing) and allow only that user.
+3. Set up an SSH key, so you don't type a password each time:
+   ```zsh
+   ssh-keygen -t ed25519 -f ~/.ssh/research_ed25519
+   ssh-copy-id -i ~/.ssh/research_ed25519.pub research@localhost
+   ```
+   Once the key works, you can turn off password logins for SSH.
+4. Do the install steps above over SSH (`ssh -t research@localhost`), then run it the same way: `ssh -t research@localhost '~/secure-browser'`. Everything it creates (images, volumes, VPN config, session state) lives in that user's home folder.
+5. The launcher can't open Safari from an SSH session, so it prints a ready-to-use login link and the password. Paste the link into Safari. Later, `ssh -t research@localhost '~/secure-browser --open'` prints it again.
+
+Things to know:
+
+- **Updates still work without sudo, except one.** See the next section.
+- **Where the viewer runs.** The viewer listens on `127.0.0.1` of the Mac, so any account can open it, with the per-session password. Opening the link in your *main* account's Safari is the most convenient, but it then decodes the video stream in your main account. For the most isolation, open it in Safari on the research user's own desktop (Fast User Switching).
+- **Other accounts can reach the port.** They still need the per-session password.
+- **An extra layer, not a guarantee.** Local privilege-escalation bugs in macOS exist, so keep macOS updated. Not yet tested on real Macs; see the limits below.
+
+### Updates and patching in a no-sudo account
+
+Nearly all patching needs no admin rights, because it happens inside the research user's own container store:
+
+| What | Needs admin? | What happens |
+|---|---|---|
+| **Chrome and the VM's Linux packages** (the frequent security fixes) | **No** | Every 6 hours the launcher checks Debian for updates, and it rebuilds the image after 7 days regardless. The rebuild is a `container build` in that user's home folder. If a rebuild fails, it won't launch an unpatched browser. |
+| **Apple Container** (the VM boundary) | **Yes** | The *check* runs fine as the research user (it only reads GitHub's advisories). *Installing* the signed package needs `sudo`, which a standard user doesn't have. The launcher notices this up front, prints "ask an admin account to update it" with the steps, and **refuses to launch** until an admin has updated it. |
+| **The `secure-browser` script** | No | It doesn't update itself. Re-download it with the `curl` line in Quick start. |
+| **macOS** | Yes | Update as usual from an admin account. |
+
+To update Apple Container, switch to an admin account and either install the newest signed `.pkg` from [apple/container releases](https://github.com/apple/container/releases), or run Apple's `sudo /usr/local/bin/update-container.sh`. The install is system-wide, so the research user picks up the new version on its next launch. That makes the sudo-less account a deliberate trade: browser fixes arrive on their own, while the one component that needs root is only changed from an account you control.
 
 ## Daily use
 

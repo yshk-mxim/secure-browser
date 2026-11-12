@@ -72,19 +72,49 @@ Running `secure-browser` from its own macOS user account, apart from your main o
 2. **The VM** (Apple Container) holds the browser and is deleted on exit
 3. **The macOS account** holds the VM, so a VM escape lands in an account with none of your files, keychain, browser profiles or logins
 
-How to set it up:
+How to set it up (a standard user, reached over SSH, with no sudo):
 
-1. Create a standard user in System Settings > Users & Groups (for example `research`). Don't sign in to iCloud or your real accounts there.
-2. Log in as that user (Fast User Switching keeps your main session running), then follow **Install** and the VPN steps above. Everything the launcher creates (`~/secure-browser`, `~/.secure-browser-wayland/`, the image, the VPN config) stays in that account's home folder.
-3. Apple Container's `.pkg` installs system-wide and needs an admin password. A standard user can't approve that: install or update it once from an admin account, or temporarily make the user an admin.
-4. Launch from that account. The viewer needs that account's desktop: stay logged in on screen, or connect with Screen Sharing. Over SSH the VM still starts, and the launcher prints a login link and password instead of opening Safari (see Troubleshooting).
+1. **Create a Standard user** in System Settings > Users & Groups (for example `research`). Don't make it an Administrator: with no `sudo` access, a compromise of the account can't change the system. Don't sign in to iCloud or your real accounts there.
+2. **Turn on Remote Login** (System Settings > General > Sharing) and allow only that user.
+3. **Set up an SSH key** so you don't retype a password:
+   ```zsh
+   ssh-keygen -t ed25519 -f ~/.ssh/research_ed25519
+   ssh-copy-id -i ~/.ssh/research_ed25519.pub research@localhost
+   ```
+   Test the key, then consider turning off SSH password logins. An entry in `~/.ssh/config` shortens the command:
+   ```
+   Host research
+       HostName localhost
+       User research
+       IdentityFile ~/.ssh/research_ed25519
+   ```
+4. **Install over SSH** with `ssh -t research@localhost` (the `-t` gives the launcher a terminal for its prompts), then follow **Install** and the VPN steps above. Everything the launcher creates (`~/secure-browser`, `~/.secure-browser-wayland/`, the image, the VPN config) stays in that account's home folder.
+5. **Apple Container comes from an admin.** Its `.pkg` installs system-wide and needs an admin password, which this user doesn't have. Install it once from your admin account, and update it there too: a required security update blocks launch until an admin has applied it (see **Updates in a no-sudo account** below).
+6. **Launch over SSH:** `ssh -t research@localhost '~/secure-browser'`, or `ssh -t research '~/secure-browser'` with the config entry. The VM starts without a desktop, but the launcher can't open Safari from SSH, so it prints a login link and password (see Troubleshooting). Paste the link into Safari. To print it again, run `ssh -t research '~/secure-browser --open'`. To finish, run `ssh -t research '~/secure-browser --stop'`.
 
 Know the limits:
 
-- The viewer is bound to `127.0.0.1` on the Mac, so other accounts on the same Mac can reach the port. They still need the random per-session password, which is stored in that account's `~/.secure-browser-wayland/state/session.pw` (private to it).
+- **Where the viewer runs.** The viewer is bound to `127.0.0.1` on the Mac, so any account on the Mac can open it, with the random per-session password. Pasting the link into your *main* account's Safari is the most convenient, but then that Safari decodes the VM's video stream. For the most isolation, open the link in Safari on the research user's own desktop (log in as it with Fast User Switching or Screen Sharing).
+- The password is stored in the research account's `~/.secure-browser-wayland/state/session.pw`, private to it.
 - macOS account separation is a strong boundary but not a perfect one: local privilege-escalation bugs exist, so keep macOS updated.
 - The account only protects your *other* accounts. Anything you do inside the research account (logins, files) is exposed to the same attacker if the browser and VM are both compromised.
+- Remote Login exposes an SSH service. Allow only the research user, use key authentication, and turn Remote Login off when you don't need it.
 - This setup hasn't been tested on real Macs yet.
+
+### Updates in a no-sudo account
+
+The automatic update checks (see **Automatic updates and security checks**) all run as the research user. What differs is whether the *apply* step needs root:
+
+| Component | Apply step | Works with no sudo? |
+|---|---|---|
+| **Chrome/Chromium and the VM's Linux packages** | `container build --pull --no-cache` rebuilds the image in the research user's own container store, every `UPDATE_CHECK_HOURS` when Debian reports updates, or after `MAX_IMAGE_AGE_DAYS` | **Yes.** Nothing outside that user's home folder is written. A failed rebuild stops the launch. |
+| **Apple Container** | `sudo installer -pkg ... -target /` (system-wide) | **No.** The check works, but a standard user can't install. The launcher detects a non-admin account *before* downloading or asking for `sudo`, prints what to ask an admin to do (install the newest signed `.pkg`, or run `sudo /usr/local/bin/update-container.sh`), and **refuses to launch** if the update is a security fix: "Not launching with a vulnerable Apple Container." A non-security update is just noted, with no prompt. |
+| **Cocoa-Way / Waypipe** (`RESEARCH_MODE=0` only) | `brew upgrade` | Only if Homebrew is usable by that user. Research mode doesn't need them. |
+| **This script** | Not automatic | Re-download it (`curl` in Quick start). |
+
+To update Apple Container, switch to an admin account, then either install the newest signed `.pkg` from <https://github.com/apple/container/releases>, or run `sudo /usr/local/bin/update-container.sh`. Because the install is system-wide, the research user finds the new version on its next launch and restarts Apple Container's services itself.
+
+This is the intended trade: the frequent fixes (the browser) apply automatically with no privileges, and the one component that needs root changes only when you, from an admin account, choose to.
 
 ## Set up the VPN (recommended)
 
