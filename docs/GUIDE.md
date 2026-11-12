@@ -108,7 +108,7 @@ The automatic update checks (see **Automatic updates and security checks**) all 
 | Component | Apply step | Works with no sudo? |
 |---|---|---|
 | **Chrome/Chromium and the VM's Linux packages** | `container build --pull --no-cache` rebuilds the image in the research user's own container store, every `UPDATE_CHECK_HOURS` when Debian reports updates, or after `MAX_IMAGE_AGE_DAYS` | **Yes.** Nothing outside that user's home folder is written. A failed rebuild stops the launch. |
-| **Apple Container** | `sudo installer -pkg ... -target /` (system-wide) | **No.** The check works, but the install fails for a standard user. The launcher then offers Apple's own `update-container.sh` (also needs root), and otherwise **refuses to launch**: "Not launching with a vulnerable Apple Container." |
+| **Apple Container** | `sudo installer -pkg ... -target /` (system-wide) | **No.** The check works, but a standard user can't install. The launcher detects a non-admin account *before* downloading or asking for `sudo`, prints what to ask an admin to do (install the newest signed `.pkg`, or run `sudo /usr/local/bin/update-container.sh`), and **refuses to launch** if the update is a security fix: "Not launching with a vulnerable Apple Container." A non-security update is just noted, with no prompt. |
 | **Cocoa-Way / Waypipe** (`RESEARCH_MODE=0` only) | `brew upgrade` | Only if Homebrew is usable by that user. Research mode doesn't need them. |
 | **This script** | Not automatic | Re-download it (`curl` in Quick start). |
 

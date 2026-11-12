@@ -89,7 +89,7 @@ Nearly all patching needs no admin rights, because it happens inside the researc
 | What | Needs admin? | What happens |
 |---|---|---|
 | **Chrome and the VM's Linux packages** (the frequent security fixes) | **No** | Every 6 hours the launcher checks Debian for updates, and it rebuilds the image after 7 days regardless. The rebuild is a `container build` in that user's home folder. If a rebuild fails, it won't launch an unpatched browser. |
-| **Apple Container** (the VM boundary) | **Yes** | The *check* runs fine as the research user (it only reads GitHub's advisories). *Installing* the signed package uses `sudo`, which a standard user doesn't have, so the install fails and the launcher **refuses to launch** until an admin has updated it. |
+| **Apple Container** (the VM boundary) | **Yes** | The *check* runs fine as the research user (it only reads GitHub's advisories). *Installing* the signed package needs `sudo`, which a standard user doesn't have. The launcher notices this up front, prints "ask an admin account to update it" with the steps, and **refuses to launch** until an admin has updated it. |
 | **The `secure-browser` script** | No | It doesn't update itself. Re-download it with the `curl` line in Quick start. |
 | **macOS** | Yes | Update as usual from an admin account. |
 

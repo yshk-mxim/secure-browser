@@ -184,6 +184,17 @@ fix_container_path() {
   die "Remove or rename '$first', or put /usr/local/bin before its folder in PATH, then rerun."
 }
 
+# Installing or updating Apple Container is system-wide and needs sudo. A standard
+# (non-admin) account can't do it, so say so up front instead of failing at sudo.
+is_admin() { /usr/bin/id -Gn | /usr/bin/grep -qw admin; }
+admin_needed_for_container() {   # admin_needed_for_container WHY
+  warn "$1"
+  info "This account is not an administrator, so it can't install or update Apple Container"
+  info '(the installer is system-wide and needs sudo). Ask an admin account to do it, then rerun here:'
+  info '  - install the newest signed .pkg from https://github.com/apple/container/releases, or'
+  info '  - run:  sudo /usr/local/bin/update-container.sh'
+}
+
 ensure_host_prerequisites() {
   [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || die 'Needs macOS on Apple silicon.'
   local major; major="$(/usr/bin/sw_vers -productVersion | /usr/bin/cut -d. -f1)"
@@ -194,12 +205,14 @@ ensure_host_prerequisites() {
   local cur; cur="$(whence -p container 2>/dev/null || true)"
   if [[ -z "$cur" ]]; then
     info 'Apple Container is not installed.'
+    is_admin || { admin_needed_for_container 'Apple Container is required.'; die 'Install Apple Container from an admin account, then rerun.'; }
     confirm "Install it now from Apple's official signed package? (asks for your admin password)" ||
       die 'Apple Container is required. Install it from https://github.com/apple/container/releases and rerun.'
     install_latest_apple_container || die 'Installation failed. Install the .pkg from https://github.com/apple/container/releases and rerun.'
   elif [[ ! -x "$PKG_CONTAINER" ]] && have_brew && [[ "$cur" == "$(brew --prefix)"/* ]]; then
     info "Apple Container is installed through Homebrew ($cur)."
     info "Apple's official signed package is preferred: it is verified by Apple's signature and notarization."
+    is_admin || { admin_needed_for_container 'Replacing the Homebrew copy needs an administrator.'; die 'Replace it from an admin account, then rerun.'; }
     confirm "Replace it with Apple's official package now? Your images and volumes are kept. (asks for your admin password)" ||
       die 'Keeping Homebrew Apple Container is not supported by this launcher. Rerun when ready to switch.'
     REPLACE_BREW_APPROVED=1
@@ -368,6 +381,7 @@ check_apple_container() {
     info "Apple Container $inst has security fixes available (security releases: ${sec_rel:-see advisories})."
     [[ -n "$adv_lines" ]] && info "$adv_lines"
     info 'The VM boundary depends on Apple Container, so it must be updated before launching.'
+    is_admin || { admin_needed_for_container "Apple Container $inst needs a security update."; die 'Not launching with a vulnerable Apple Container. Update it from an admin account, then rerun.'; }
     confirm "Download and install Apple Container ${latest:-latest} now? (stops running containers; asks for your admin password)" ||
       die 'Not launching with a vulnerable Apple Container. Rerun when you are ready to update.'
     if ! install_latest_apple_container; then
@@ -389,6 +403,10 @@ check_apple_container() {
     info "Apple Container updated to $inst."
   elif [[ -n "$latest" ]]; then
     info "Apple Container $inst: newer release $latest available (no security fixes listed)."
+    if ! is_admin; then
+      info '  Not required. To update, ask an admin account to install it (this account has no sudo).'
+      return 0
+    fi
     confirm "Update to $latest now anyway?" && { install_latest_apple_container || warn 'Update failed; continuing with the current version.'; }
   fi
 }
