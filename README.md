@@ -127,7 +127,7 @@ The [full guide](docs/GUIDE.md) covers every option, the VPN setup walkthrough, 
 
 ## Contributing
 
-Issues and pull requests are welcome, especially reports from different Mac models and macOS versions, Apple Container versions and VPN providers. When reporting a problem, include the output of `~/secure-browser --test`, with IP addresses removed.
+Issues and pull requests are welcome, especially reports from different Mac models and macOS versions, Apple Container versions and VPN providers. When reporting a problem, include the output of `~/secure-browser --test`, with IP addresses removed. For security vulnerabilities, don't use public issues or pull requests: report them privately as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
