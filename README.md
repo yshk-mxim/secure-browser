@@ -93,7 +93,13 @@ Nearly all patching needs no admin rights, because it happens inside the researc
 | **The `secure-browser` script** | No | It doesn't update itself. Re-download it with the `curl` line in Quick start. |
 | **macOS** | Yes | Update as usual from an admin account. |
 
-To update Apple Container, switch to an admin account and either install the newest signed `.pkg` from [apple/container releases](https://github.com/apple/container/releases), or run Apple's `sudo /usr/local/bin/update-container.sh`. The install is system-wide, so the research user picks up the new version on its next launch. That makes the sudo-less account a deliberate trade: browser fixes arrive on their own, while the one component that needs root is only changed from an account you control.
+To update Apple Container:
+
+1. **In the research account**, stop its Apple Container service: `container system stop`. (Apple's updater refuses to run while it's running, and it runs in the research user's session.)
+2. **In an admin account**, update it with either the newest signed `.pkg` from [apple/container releases](https://github.com/apple/container/releases), or Apple's own updater, which the package installs: `sudo /usr/local/bin/update-container.sh` (latest release; add `-v <version>` for a specific one, or `-f` to force).
+3. **Back in the research account**, check `container --version`, then run `~/secure-browser` again. The install is system-wide, so it picks up the new version.
+
+ That makes the sudo-less account a deliberate trade: browser fixes arrive on their own, while the one component that needs root is only changed from an account you control.
 
 ## Daily use
 

@@ -112,7 +112,11 @@ The automatic update checks (see **Automatic updates and security checks**) all 
 | **Cocoa-Way / Waypipe** (`RESEARCH_MODE=0` only) | `brew upgrade` | Only if Homebrew is usable by that user. Research mode doesn't need them. |
 | **This script** | Not automatic | Re-download it (`curl` in Quick start). |
 
-To update Apple Container, switch to an admin account, then either install the newest signed `.pkg` from <https://github.com/apple/container/releases>, or run `sudo /usr/local/bin/update-container.sh`. Because the install is system-wide, the research user finds the new version on its next launch and restarts Apple Container's services itself.
+To update Apple Container:
+
+1. **In the research account**, stop its service: `container system stop`. Apple's updater refuses to run while `container` is running ("`container` is still running. Please ensure the service is stopped by running `container system stop`"), and that service runs in the research user's session, which an admin account may not see.
+2. **In an admin account**, update with either the newest signed `.pkg` from <https://github.com/apple/container/releases> (double-click it), or Apple's own updater, `sudo /usr/local/bin/update-container.sh`. That script is part of `apple/container` and is installed by the same signed package. It installs the latest release by default; `-v <version>` picks a specific one, and `-f` forces a reinstall of the current one.
+3. **Back in the research account**, run `container --version` to confirm, then `~/secure-browser`. The install is system-wide, so the research user finds the new version and starts Apple Container's services itself.
 
 This is the intended trade: the frequent fixes (the browser) apply automatically with no privileges, and the one component that needs root changes only when you, from an admin account, choose to.
 
