@@ -77,10 +77,23 @@ For an additional barrier, install and run `secure-browser` in a **dedicated mac
 
 Things to know:
 
-- **Apple Container needs an admin once.** Its installer is system-wide and asks for an admin password, which the no-sudo user doesn't have. Install and update it from your admin account; the research user then just uses it. A required security update blocks launch until an admin updates it.
+- **Updates still work without sudo, except one.** See the next section.
 - **Where the viewer runs.** The viewer listens on `127.0.0.1` of the Mac, so any account can open it, with the per-session password. Opening the link in your *main* account's Safari is the most convenient, but it then decodes the video stream in your main account. For the most isolation, open it in Safari on the research user's own desktop (Fast User Switching).
 - **Other accounts can reach the port.** They still need the per-session password.
 - **An extra layer, not a guarantee.** Local privilege-escalation bugs in macOS exist, so keep macOS updated. Not yet tested on real Macs; see the limits below.
+
+### Updates and patching in a no-sudo account
+
+Nearly all patching needs no admin rights, because it happens inside the research user's own container store:
+
+| What | Needs admin? | What happens |
+|---|---|---|
+| **Chrome and the VM's Linux packages** (the frequent security fixes) | **No** | Every 6 hours the launcher checks Debian for updates, and it rebuilds the image after 7 days regardless. The rebuild is a `container build` in that user's home folder. If a rebuild fails, it won't launch an unpatched browser. |
+| **Apple Container** (the VM boundary) | **Yes** | The *check* runs fine as the research user (it only reads GitHub's advisories). *Installing* the signed package uses `sudo`, which a standard user doesn't have, so the install fails and the launcher **refuses to launch** until an admin has updated it. |
+| **The `secure-browser` script** | No | It doesn't update itself. Re-download it with the `curl` line in Quick start. |
+| **macOS** | Yes | Update as usual from an admin account. |
+
+To update Apple Container, switch to an admin account and either install the newest signed `.pkg` from [apple/container releases](https://github.com/apple/container/releases), or run Apple's `sudo /usr/local/bin/update-container.sh`. The install is system-wide, so the research user picks up the new version on its next launch. That makes the sudo-less account a deliberate trade: browser fixes arrive on their own, while the one component that needs root is only changed from an account you control.
 
 ## Daily use
 

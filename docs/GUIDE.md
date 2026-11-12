@@ -89,7 +89,7 @@ How to set it up (a standard user, reached over SSH, with no sudo):
        IdentityFile ~/.ssh/research_ed25519
    ```
 4. **Install over SSH** with `ssh -t research@localhost` (the `-t` gives the launcher a terminal for its prompts), then follow **Install** and the VPN steps above. Everything the launcher creates (`~/secure-browser`, `~/.secure-browser-wayland/`, the image, the VPN config) stays in that account's home folder.
-5. **Apple Container comes from an admin.** Its `.pkg` installs system-wide and needs an admin password, which this user doesn't have. Install it once from your admin account, and update it there too: a required security update blocks launch until an admin has applied it.
+5. **Apple Container comes from an admin.** Its `.pkg` installs system-wide and needs an admin password, which this user doesn't have. Install it once from your admin account, and update it there too: a required security update blocks launch until an admin has applied it (see **Updates in a no-sudo account** below).
 6. **Launch over SSH:** `ssh -t research@localhost '~/secure-browser'`, or `ssh -t research '~/secure-browser'` with the config entry. The VM starts without a desktop, but the launcher can't open Safari from SSH, so it prints a login link and password (see Troubleshooting). Paste the link into Safari. To print it again, run `ssh -t research '~/secure-browser --open'`. To finish, run `ssh -t research '~/secure-browser --stop'`.
 
 Know the limits:
@@ -100,6 +100,21 @@ Know the limits:
 - The account only protects your *other* accounts. Anything you do inside the research account (logins, files) is exposed to the same attacker if the browser and VM are both compromised.
 - Remote Login exposes an SSH service. Allow only the research user, use key authentication, and turn Remote Login off when you don't need it.
 - This setup hasn't been tested on real Macs yet.
+
+### Updates in a no-sudo account
+
+The automatic update checks (see **Automatic updates and security checks**) all run as the research user. What differs is whether the *apply* step needs root:
+
+| Component | Apply step | Works with no sudo? |
+|---|---|---|
+| **Chrome/Chromium and the VM's Linux packages** | `container build --pull --no-cache` rebuilds the image in the research user's own container store, every `UPDATE_CHECK_HOURS` when Debian reports updates, or after `MAX_IMAGE_AGE_DAYS` | **Yes.** Nothing outside that user's home folder is written. A failed rebuild stops the launch. |
+| **Apple Container** | `sudo installer -pkg ... -target /` (system-wide) | **No.** The check works, but the install fails for a standard user. The launcher then offers Apple's own `update-container.sh` (also needs root), and otherwise **refuses to launch**: "Not launching with a vulnerable Apple Container." |
+| **Cocoa-Way / Waypipe** (`RESEARCH_MODE=0` only) | `brew upgrade` | Only if Homebrew is usable by that user. Research mode doesn't need them. |
+| **This script** | Not automatic | Re-download it (`curl` in Quick start). |
+
+To update Apple Container, switch to an admin account, then either install the newest signed `.pkg` from <https://github.com/apple/container/releases>, or run `sudo /usr/local/bin/update-container.sh`. Because the install is system-wide, the research user finds the new version on its next launch and restarts Apple Container's services itself.
+
+This is the intended trade: the frequent fixes (the browser) apply automatically with no privileges, and the one component that needs root changes only when you, from an admin account, choose to.
 
 ## Set up the VPN (recommended)
 
