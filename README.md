@@ -79,6 +79,7 @@ For an additional barrier, install and run `secure-browser` in a **dedicated mac
 | `~/secure-browser --update` | Run every update check now and rebuild |
 | `~/secure-browser --import-vpn` | Save a WireGuard config from the clipboard (private file, clipboard cleared) |
 | `~/secure-browser --check` | Show what's installed; changes nothing |
+| `~/secure-browser --uninstall` | Remove what it created, at a level you choose (see [Uninstall](#uninstall)) |
 
 Inside the browser, use **Ctrl** shortcuts (Ctrl-T, Ctrl-L, Ctrl-W). Closing the last browser window ends the session.
 
@@ -118,6 +119,23 @@ Edit the top of `~/secure-browser`. The main options:
 | `UPDATE_CHECK_HOURS` | `6` | How often to check for browser and Apple Container fixes |
 
 The [full guide](docs/GUIDE.md) covers every option, the VPN setup walkthrough, convenience mode and troubleshooting.
+
+## Uninstall
+
+```zsh
+~/secure-browser --uninstall
+```
+
+Pick how much to remove. Each level includes the ones before it, and nothing is deleted until you confirm the exact list:
+
+| Level | Removes |
+|---|---|
+| 1. Session only | Stops the browser and deletes its VM and session state. Keeps the image, so the next launch is fast. |
+| 2. + Browser image | Also deletes the built image and build folder, and stops the image builder. The next launch rebuilds. |
+| 3. + Data | Also deletes the persistent profile volume, the Cocoa-Way app-list entry and the whole `~/.secure-browser-wayland` folder. |
+| 4. + Everything | Also deletes your saved WireGuard config (`~/.config/secure-browser/wireguard.conf`) and the script itself. |
+
+It never removes Apple Container, Homebrew packages, the shared Debian base image or your `~/Downloads/secure-browser` folder; it lists them at the end with the commands to remove them yourself. If you ran it from a separate Mac account, run `--uninstall` as that account. When you're done with the VPN account, also revoke the WireGuard config in your provider's dashboard.
 
 ## Where everything comes from
 
